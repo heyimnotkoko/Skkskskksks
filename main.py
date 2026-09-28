@@ -413,22 +413,26 @@ async def stop_assistant() -> None:
     ASS_MENTION = ""
 
 
-YOUTUBE_CLIENTS = ("web_safari", "android_vr", "web_embedded", "tv", "default")
+# YouTube extraction is deliberately cookie-free.
+# Android is preferred because it can provide direct CDN formats without
+# browser cookies. Each client is tried separately to avoid mixed-client URLs.
+YOUTUBE_CLIENTS = ("android", "tv", "web_embedded", "android_vr")
 
 
 def ytdlp_base(client: str) -> dict[str, Any]:
-    opts: dict[str, Any] = {
+    return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "retries": 2,
+        "fragment_retries": 2,
         "socket_timeout": 20,
-        "extractor_args": {"youtube": {"player_client": [client]}},
+        "extractor_args": {
+            "youtube": {
+                "player_client": [client],
+            }
+        },
     }
-    cookiefile = Path(os.getenv("YTDLP_COOKIES_FILE", "cookies.txt"))
-    if cookiefile.is_file():
-        opts["cookiefile"] = str(cookiefile)
-    return opts
 
 
 def youtube_info(url: str) -> dict[str, Any]:
@@ -436,11 +440,15 @@ def youtube_info(url: str) -> dict[str, Any]:
     for client in YOUTUBE_CLIENTS:
         try:
             opts = ytdlp_base(client)
+            opts["skip_download"] = True
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         except Exception as exc:
             last = exc
-            LOGGER.warning("YouTube metadata failed client=%s error=%s", client, str(exc)[:250])
+            LOGGER.warning(
+                "YouTube metadata failed client=%s error=%s",
+                client, str(exc)[:250]
+            )
     raise last or RuntimeError("YouTube metadata unavailable")
 
 
@@ -457,20 +465,24 @@ def youtube_search(query: str, limit: int = 4) -> list[dict[str, Any]]:
                 return entries[:limit]
         except Exception as exc:
             last = exc
-            LOGGER.warning("YouTube search failed client=%s error=%s", client, str(exc)[:250])
+            LOGGER.warning(
+                "YouTube search failed client=%s error=%s",
+                client, str(exc)[:250]
+            )
     raise last or RuntimeError("YouTube search unavailable")
 
 
 def choose_audio_format() -> str:
-    # A moderate bitrate is enough for voice-chat music and avoids unnecessarily
-    # large temporary files. yt-dlp will fall back if the exact filter is absent.
-    return "bestaudio[abr<=160]/bestaudio/best"
+    return "bestaudio/best"
 
 
 def download_audio(url: str) -> str:
     last: Exception | None = None
     unique = uuid.uuid4().hex
-    attempts = ("web_safari", "android_vr", "web_embedded", "tv", "default")
+
+    # Keep Android first. No cookies or browser session is used.
+    attempts = ("android", "tv", "web_embedded", "android_vr")
+
     for client in attempts:
         try:
             opts = ytdlp_base(client)
@@ -479,24 +491,67 @@ def download_audio(url: str) -> str:
                     "format": choose_audio_format(),
                     "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
                     "overwrites": True,
+                    "continuedl": False,
+                    "nopart": True,
                 }
             )
+
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
-            files = list(DOWNLOADS_DIR.glob(f"{unique}.*"))
+
+            files = [
+                f for f in DOWNLOADS_DIR.glob(f"{unique}.*")
+                if f.is_file() and f.stat().st_size > 0
+            ]
             if not files:
                 raise FileNotFoundError("Downloaded file was not found")
-            path = files[0]
+
+            path = max(files, key=lambda f: f.stat().st_size)
             if path.stat().st_size > MAX_AUDIO_MB * 1024 * 1024:
                 cleanup_file(path)
-                raise RuntimeError(f"الملف أكبر من الحد المسموح ({MAX_AUDIO_MB} MB).")
+                raise RuntimeError(
+                    f"الملف أكبر من الحد المسموح ({MAX_AUDIO_MB} MB)."
+                )
             return str(path)
+
         except Exception as exc:
             last = exc
-            for p in DOWNLOADS_DIR.glob(f"{unique}.*"):
-                cleanup_file(p)
-            LOGGER.warning("YouTube download failed client=%s error=%s", client, str(exc)[:300])
+            for f in DOWNLOADS_DIR.glob(f"{unique}.*"):
+                cleanup_file(f)
+            LOGGER.warning(
+                "YouTube download failed client=%s error=%s",
+                client, str(exc)[:300]
+            )
+
     raise last or RuntimeError("Audio download failed")
+
+
+def format_error(exc: Exception) -> str:
+    text = str(exc)
+    low = text.lower()
+
+    if "requested format is not available" in low:
+        return "يوتيوب لم يعرض صيغة صوت قابلة للتنزيل لهذا المقطع."
+
+    if "403" in low or "forbidden" in low:
+        return (
+            "يوتيوب رفض رابط التنزيل من خادم Railway. "
+            "تمت محاولة عدة اتصالات بدون Cookies؛ جرّب مقطعًا آخر إذا استمر الرفض."
+        )
+
+    if "sign in to confirm" in low or "not a bot" in low:
+        return (
+            "يوتيوب فعّل تحققًا على عنوان خادم Railway لهذا الطلب. "
+            "البوت يعمل بدون Cookies، لكن يوتيوب قد يرفض بعض الطلبات من الخادم."
+        )
+
+    if "po token" in low:
+        return (
+            "يوتيوب طلب PO Token لهذا الاتصال. "
+            "تمت محاولة عميل لا يعتمد عليه أولًا، بدون Cookies."
+        )
+
+    return text[:700]
 
 
 async def resolve_query(query: str) -> tuple[str, str, str, int]:
