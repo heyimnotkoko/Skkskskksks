@@ -16,7 +16,14 @@ from typing import Any
 import yt_dlp
 from pyrogram import Client, filters, idle
 from pyrogram.enums import ChatMemberStatus, ChatType
-from pyrogram.errors import RPCError, SessionPasswordNeeded, UserNotParticipant
+from pyrogram.errors import (
+    RPCError,
+    SessionPasswordNeeded,
+    UserNotParticipant,
+    PhoneCodeExpired,
+    PhoneCodeInvalid,
+    PhoneNumberInvalid,
+)
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
 
 try:
@@ -366,7 +373,12 @@ async def start_assistant(session: str | None = None) -> bool:
         ASS_MENTION = me.mention
         if PyTgCalls is None:
             LOGGER.error("PyTgCalls is unavailable: %s", PYTGCALLS_IMPORT_ERROR)
-            return True
+            try:
+                await app2.stop()
+            except Exception:
+                pass
+            app2 = None
+            return False
         pytgcalls = PyTgCalls(app2)
         await pytgcalls.start()
         register_pytgcalls_handlers()
@@ -517,8 +529,10 @@ def format_error(exc: Exception) -> str:
     low = text.lower()
     if "requested format is not available" in low:
         return "يوتيوب لم يعرض صيغة صوت مناسبة لهذا الاتصال."
-    if "sign in" in low or "not a bot" in low or "cookies" in low:
-        return "يوتيوب رفض طلب خادم Railway. قد تحتاج جلسة cookies أو معالجة PO Token حسب حالة الخادم."
+    if "403" in low or "forbidden" in low:
+        return "يوتيوب رفض تنزيل الملف من خادم Railway (403). جرّب رابطًا آخر أو وفّر cookies/طريقة مصادقة مناسبة."
+    if "sign in" in low or "not a bot" in low or "cookies" in low or "po token" in low:
+        return "يوتيوب رفض طلب خادم Railway. قد تحتاج cookies أو معالجة PO Token حسب حالة الخادم."
     return text[:700]
 
 
@@ -615,7 +629,7 @@ async def start_next(chat_id: int) -> bool:
                         await pytgcalls.change_stream(chat_id, stream)
                     else:
                         await pytgcalls.join_group_call(
-                            chat_id, stream, stream_type=StreamType.pulse_stream
+                            chat_id, stream, stream_type=StreamType().pulse_stream
                         )
                 except (NoActiveGroupCall, TelegramServerError, UnMuteNeeded) as exc:
                     queue_finish(row_id)
@@ -866,13 +880,46 @@ async def callback_controls(_, query: CallbackQuery):
         return await query.answer()
     mapping = {"pause_cb": "pause", "resume_cb": "resume", "skip_cb": "skip", "end_cb": "stop"}
     action = mapping[query.data]
-    # Callback has a real actor, so the normal admin check can be used.
-    fake = query.message
-    fake.from_user = query.from_user
-    if not await is_admin_for_command(fake):
+    # Callback queries carry the real actor separately; do not mutate the
+    # Pyrogram Message object (its from_user field is not a safe writable field).
+    chat_id = query.message.chat.id
+    actor_id = query.from_user.id
+    allowed = actor_id in SUDO_USERS
+    if not allowed:
+        try:
+            member = await app.get_chat_member(chat_id, actor_id)
+            allowed = member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}
+        except RPCError:
+            allowed = False
+    if not allowed:
         return await query.answer("هذا الخيار للمشرفين فقط.", show_alert=True)
     await query.answer()
-    await handle_control(fake, action)
+
+    if not pytgcalls:
+        return await query.message.reply_text("حساب المساعد غير متصل.")
+    try:
+        if action == "pause":
+            await pytgcalls.pause_stream(chat_id)
+            text = "تم إيقاف التشغيل مؤقتًا."
+        elif action == "resume":
+            await pytgcalls.resume_stream(chat_id)
+            text = "تم استكمال التشغيل."
+        elif action == "skip":
+            conn = db_connect()
+            try:
+                conn.execute("DELETE FROM queue WHERE chat_id=? AND status='playing'", (chat_id,))
+                conn.commit()
+            finally:
+                conn.close()
+            await start_next(chat_id)
+            text = "تم تخطي المقطع الحالي."
+        else:
+            await leave_and_clear(chat_id)
+            text = "تم إنهاء التشغيل ومسح قائمة الانتظار."
+        await query.message.reply_text(text)
+    except Exception as exc:
+        LOGGER.exception("Callback control failed: %s", type(exc).__name__)
+        await query.message.reply_text(f"تعذر تنفيذ الأمر.\n\n`{format_error(exc)}`")
 
 
 @app.on_message(filters.command("المساعد") & filters.user(OWNER_ID))
@@ -942,15 +989,32 @@ async def login_flow(_, message: Message):
             return await message.reply_text("تم إرسال رمز التحقق. أرسله الآن.")
         if state["step"] == "code":
             code = re.sub(r"\D", "", message.text)
+            if len(code) < 4:
+                return await message.reply_text("رمز التحقق غير صحيح.")
             try:
                 await state["client"].sign_in(state["phone"], state["hash"], code)
             except SessionPasswordNeeded:
                 state["step"] = "password"
                 return await message.reply_text("أرسل كلمة مرور المصادقة الثنائية.")
+            except PhoneCodeExpired:
+                # Keep the login flow alive and request a fresh code instead of
+                # forcing the owner to restart the whole process.
+                try:
+                    sent = await state["client"].send_code(state["phone"])
+                    state["hash"] = sent.phone_code_hash
+                    state["created"] = time.monotonic()
+                    return await message.reply_text("انتهت صلاحية الرمز. تم إرسال رمز جديد، أرسله الآن.")
+                except Exception as resend_exc:
+                    LOGGER.warning("Code resend failed: %s", type(resend_exc).__name__)
+                    return await message.reply_text("انتهت صلاحية الرمز. أعد العملية من /المساعد.")
+            except PhoneCodeInvalid:
+                return await message.reply_text("رمز التحقق غير صحيح. أرسل الرمز الأخير الذي وصلك.")
             return await finish_login(message, state)
         if state["step"] == "password":
             await state["client"].check_password(message.text)
             return await finish_login(message, state)
+    except PhoneNumberInvalid:
+        return await message.reply_text("رقم الهاتف غير صحيح أو غير مقبول من Telegram.")
     except Exception as exc:
         LOGGER.exception("Login failed: %s", type(exc).__name__)
         client = state.get("client")
