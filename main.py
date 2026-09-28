@@ -428,6 +428,17 @@ if YTDLP_PROXY and YTDLP_PROXY not in YTDLP_PROXIES:
     YTDLP_PROXIES.append(YTDLP_PROXY)
 # Optional: Netscape cookies.txt exported from a THROWAWAY Google account.
 YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
+# Optional: the same cookies.txt content encoded as base64 (easiest on Railway).
+_cookies_b64 = os.getenv("YTDLP_COOKIES_B64", "").strip()
+if _cookies_b64 and not YTDLP_COOKIES_FILE:
+    try:
+        import base64
+        _cp = "/tmp/yt_cookies.txt"
+        with open(_cp, "wb") as _f:
+            _f.write(base64.b64decode(_cookies_b64))
+        YTDLP_COOKIES_FILE = _cp
+    except Exception as _e:  # noqa: BLE001
+        LOGGER.warning("Invalid YTDLP_COOKIES_B64: %s", _e)
 YOUTUBE_CLIENT_PROFILES: list[list[str]] = [
     ["default"],      # yt-dlp's own recommended clients
     ["android_vr"],   # does not need a PO Token for audio
@@ -529,10 +540,13 @@ def download_audio(url: str) -> str:
     unique = uuid.uuid4().hex
 
     def run(clients: list[str]) -> None:
-        opts = ytdlp_base(clients)
+        if is_soundcloud_url(url):
+            opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "retries": 2, "socket_timeout": 20}
+        else:
+            opts = ytdlp_base(clients)
         opts.update(
             {
-                "format": AUDIO_FORMAT,
+                "format": "bestaudio/best" if is_soundcloud_url(url) else AUDIO_FORMAT,
                 "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
                 "overwrites": True,
             }
@@ -541,7 +555,10 @@ def download_audio(url: str) -> str:
             ydl.extract_info(url, download=True)
 
     try:
-        _with_clients(run)
+        if is_soundcloud_url(url):
+            run([])
+        else:
+            _with_clients(run)
         files = [f for f in DOWNLOADS_DIR.glob(f"{unique}.*") if not f.name.endswith(".part")]
         if not files:
             raise FileNotFoundError("Downloaded file was not found")
@@ -556,7 +573,50 @@ def download_audio(url: str) -> str:
         raise
 
 
-async def resolve_query(query: str) -> tuple[str, str, str, int]:
+# ---------------------------------------------------------------------------
+# SoundCloud fallback: used automatically when YouTube blocks the server.
+# Disable with SOUNDCLOUD_FALLBACK=0
+# ---------------------------------------------------------------------------
+SOUNDCLOUD_FALLBACK = os.getenv("SOUNDCLOUD_FALLBACK", "1").strip().lower() not in {"0", "false", "no"}
+YOUTUBE_URL_RE = re.compile(r"^https?://(?:www\.|m\.|music\.)?(?:youtube\.com|youtu\.be)/", re.I)
+
+
+def is_soundcloud_url(url: str) -> bool:
+    return bool(re.match(r"^https?://(?:[\w-]+\.)?soundcloud\.com/", url, re.I))
+
+
+def soundcloud_search(query: str, limit: int = 1) -> list[dict[str, Any]]:
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+        "extract_flat": True,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(f"scsearch{limit}:{query}", download=False)
+    entries = [x for x in (data.get("entries") or []) if x]
+    if not entries:
+        raise RuntimeError("SoundCloud search returned no results")
+    return entries[:limit]
+
+
+def item_url(item: dict[str, Any]) -> str:
+    return item.get("webpage_url") or item.get("url") or f"https://www.youtube.com/watch?v={item.get('id')}"
+
+
+def youtube_oembed_title(url: str) -> str:
+    """Get a video's title without yt-dlp (used only to search SoundCloud)."""
+    import json as _json
+    import urllib.parse
+    import urllib.request
+
+    api = "https://www.youtube.com/oembed?format=json&url=" + urllib.parse.quote(url, safe="")
+    with urllib.request.urlopen(api, timeout=8) as r:  # noqa: S310
+        return (_json.loads(r.read().decode("utf-8")).get("title") or "").strip()
+
+
+async def _yt_lookup(query: str) -> tuple[str, dict[str, Any]]:
     if re.match(r"^https?://", query, re.I):
         url = query
     else:
@@ -564,12 +624,46 @@ async def resolve_query(query: str) -> tuple[str, str, str, int]:
             results = await asyncio.to_thread(youtube_search, query, 1)
         if not results:
             raise RuntimeError("لم يتم العثور على نتيجة.")
-        item = results[0]
-        url = item.get("webpage_url") or f"https://www.youtube.com/watch?v={item.get('id')}"
+        url = item_url(results[0])
+    if is_soundcloud_url(url):
+        return url, {}
     async with SEARCH_SEMAPHORE:
         info = await asyncio.to_thread(youtube_info, url)
+    return url, info
+
+
+async def _sc_lookup(text: str) -> tuple[str, dict[str, Any]]:
+    async with SEARCH_SEMAPHORE:
+        results = await asyncio.to_thread(soundcloud_search, text, 1)
+    item = results[0]
+    return item_url(item), item
+
+
+async def resolve_query(query: str) -> tuple[str, str, str, int]:
+    try:
+        url, info = await _yt_lookup(query)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("YouTube lookup failed: %s", str(exc)[:200])
+        if not SOUNDCLOUD_FALLBACK:
+            raise
+        search_text = query
+        if re.match(r"^https?://", query, re.I):
+            search_text = ""
+            if YOUTUBE_URL_RE.match(query):
+                try:
+                    search_text = await asyncio.to_thread(youtube_oembed_title, query)
+                except Exception as oe:  # noqa: BLE001
+                    LOGGER.warning("oEmbed title lookup failed: %s", oe)
+        if not search_text:
+            raise exc
+        try:
+            url, info = await _sc_lookup(search_text)
+            LOGGER.info("Using SoundCloud fallback: %s", url)
+        except Exception as sc_exc:  # noqa: BLE001
+            LOGGER.warning("SoundCloud fallback failed: %s", str(sc_exc)[:200])
+            raise exc
     title = info.get("title") or "بدون عنوان"
-    video_id = info.get("id") or ""
+    video_id = str(info.get("id") or "")
     duration = int(info.get("duration") or 0)
     if duration > DURATION_LIMIT * 60:
         raise RuntimeError(f"المقطع يتجاوز الحد المسموح وهو {DURATION_LIMIT} دقيقة.")
@@ -971,17 +1065,29 @@ async def search_handler(_, message: Message):
     RATE_LIMITS[key] = now
     status = await message.reply_text("جاري البحث...")
     try:
-        async with SEARCH_SEMAPHORE:
-            results = await asyncio.to_thread(youtube_search, query, 4)
+        source_note = ""
+        try:
+            async with SEARCH_SEMAPHORE:
+                results = await asyncio.to_thread(youtube_search, query, 4)
+        except Exception as yt_exc:  # noqa: BLE001
+            if not SOUNDCLOUD_FALLBACK:
+                raise
+            LOGGER.warning("YouTube search failed, using SoundCloud: %s", str(yt_exc)[:200])
+            try:
+                async with SEARCH_SEMAPHORE:
+                    results = await asyncio.to_thread(soundcloud_search, query, 4)
+            except Exception:  # noqa: BLE001
+                raise yt_exc
+            source_note = "المصدر: SoundCloud (يوتيوب غير متاح حاليًا)\n\n"
         if not results:
             return await status.edit_text("لم يتم العثور على نتائج.")
         lines = []
         for i, item in enumerate(results, 1):
             title = item.get("title") or "بدون عنوان"
             duration = item.get("duration_string") or item.get("duration") or "غير معروف"
-            url = item.get("webpage_url") or f"https://www.youtube.com/watch?v={item.get('id')}"
+            url = item_url(item)
             lines.append(f"{i}. {title}\nالمدة: `{duration}`\nالرابط: {url}")
-        await status.edit_text("\n\n".join(lines), disable_web_page_preview=True)
+        await status.edit_text(source_note + "\n\n".join(lines), disable_web_page_preview=True)
     except Exception as exc:
         await status.edit_text(f"فشل البحث.\n\nالخطأ: `{format_error(exc)}`")
 
