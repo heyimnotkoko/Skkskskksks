@@ -357,10 +357,55 @@ def clean_url(url: str) -> str:
     return url
 
 def _common_opts() -> dict:
-    opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'retries': 2}
+    # YouTube changes its anti-bot requirements frequently. Keep the
+    # default client list lightweight and allow Railway ENV overrides.
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'retries': 2,
+        'socket_timeout': 20,
+    }
+
     if config.COOKIES_FILE.is_file():
         opts['cookiefile'] = str(config.COOKIES_FILE)
+
+    # Optional PO Token support. A token is video/session dependent and
+    # should be supplied externally when YouTube requires it.
+    po_token = os.getenv('YTDLP_PO_TOKEN', '').strip()
+    if po_token:
+        opts['extractor_args'] = {
+            'youtube': {
+                'player_client': ['mweb', 'web_embedded'],
+                'po_token': [f'mweb.gvs+{po_token}'],
+            }
+        }
+    else:
+        # These clients currently avoid some of the web-client checks.
+        # yt-dlp will select usable formats from the available clients.
+        opts['extractor_args'] = {
+            'youtube': {
+                'player_client': ['android_vr', 'web_embedded', 'tv']
+            }
+        }
+
     return opts
+
+def _youtube_error_message(exc: Exception) -> str:
+    msg = str(exc)
+    low = msg.lower()
+    if 'sign in to confirm' in low or 'not a bot' in low or 'cookies' in low:
+        if config.COOKIES_FILE.is_file():
+            return (
+                'يوتيوب رفض الطلب من الخادم. ملف cookies موجود، '
+                'لكن قد تحتاج الجلسة إلى PO Token صالح.'
+            )
+        return (
+            'يوتيوب رفض الطلب من الخادم بسبب التحقق من المستخدم. '
+            'أضف YTDLP_COOKIES_B64 إلى Railway، وقد تحتاج أيضًا إلى YTDLP_PO_TOKEN.'
+        )
+    return msg[:1200]
+
 
 def _audio_opts() -> dict:
     opts = _common_opts()
@@ -907,12 +952,12 @@ async def play(_, message: Message):
                 target_url = results[0].get('webpage_url') or f"https://www.youtube.com/watch?v={results[0].get('id')}"
             except Exception as exc:
                 LOGGER.error('YouTube search failed: %s', exc)
-                return await fallen.edit_text(f'صارت مشكلة\n\nالخطأ: `{exc}`')
+                return await fallen.edit_text(f'صارت مشكلة\\n\\nالخطأ: `{_youtube_error_message(exc)}`')
         try:
             title, duration, videoid, duration_seconds = await _metadata(target_url)
         except Exception as exc:
             LOGGER.error('YouTube metadata failed: %s', exc)
-            return await fallen.edit_text(f'صارت مشكلة\n\nالخطأ: `{exc}`')
+            return await fallen.edit_text(f'صارت مشكلة\\n\\nالخطأ: `{_youtube_error_message(exc)}`')
         if duration_seconds / 60 > DURATION_LIMIT:
             return await fallen.edit_text('‹ : المقطع طويل جداً .')
         try:
