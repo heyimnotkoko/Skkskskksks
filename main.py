@@ -100,6 +100,19 @@ CHAT_LOCKS: dict[int, asyncio.Lock] = {}
 CURRENT_FILES: dict[int, str] = {}
 NOW_PLAYING: dict[int, int] = {}
 RATE_LIMITS: dict[tuple[int, str], float] = {}
+# Chats where the assistant is currently joined to the voice chat. Tracked
+# separately from CURRENT_FILES: the file entry is removed when a track ends
+# while the assistant is still in the call, which used to make the bot try to
+# "join" again and fail with "Already joined into group call".
+IN_CALL: set[int] = set()
+_BG_TASKS: set[asyncio.Future] = set()
+
+# Auto-clean settings (seconds). Set AUTO_DELETE_COMMANDS=0 to keep user commands.
+TEMP_MESSAGE_SECONDS = int(os.getenv("TEMP_MESSAGE_SECONDS", "10"))
+ERROR_MESSAGE_SECONDS = int(os.getenv("ERROR_MESSAGE_SECONDS", "20"))
+SEARCH_RESULT_SECONDS = int(os.getenv("SEARCH_RESULT_SECONDS", "90"))
+AUTO_DELETE_COMMANDS = os.getenv("AUTO_DELETE_COMMANDS", "1").strip().lower() not in {"0", "false", "no"}
+JANITOR_INTERVAL = int(os.getenv("JANITOR_INTERVAL", "600"))
 
 
 def db_connect() -> sqlite3.Connection:
@@ -257,13 +270,16 @@ def cleanup_file(path: str | Path | None) -> None:
         LOGGER.warning("Could not remove temporary file: %s", type(exc).__name__)
 
 
-def cleanup_temp_files(older_than_seconds: int = STALE_FILE_MINUTES * 60) -> int:
+def cleanup_temp_files(older_than_seconds: int = STALE_FILE_MINUTES * 60, protected: set[Path] | None = None) -> int:
     removed = 0
     now = time.time()
+    protected = protected or set()
     for directory in (DOWNLOADS_DIR, CACHE_DIR):
         for path in directory.iterdir():
             try:
                 if not path.is_file():
+                    continue
+                if path.resolve() in protected:
                     continue
                 if now - path.stat().st_mtime >= older_than_seconds:
                     path.unlink()
@@ -283,6 +299,94 @@ def cleanup_all_temp_files() -> None:
                     shutil.rmtree(path)
             except OSError:
                 continue
+
+
+def spawn(coro) -> asyncio.Future:
+    """Run a coroutine in the background and keep a reference until it ends."""
+    task = asyncio.ensure_future(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
+
+
+async def _delete_after(chat_id: int, msg_id: int, delay: float) -> None:
+    await asyncio.sleep(delay)
+    try:
+        await app.delete_messages(chat_id, msg_id)
+    except Exception:  # noqa: BLE001 - already deleted / no permission
+        pass
+
+
+def _is_private(message: Message) -> bool:
+    return message.chat.type == ChatType.PRIVATE
+
+
+def schedule_delete(msg: Message | None, delay: float) -> None:
+    if msg is None or getattr(msg, "chat", None) is None or _is_private(msg):
+        return
+    spawn(_delete_after(msg.chat.id, msg.id, delay))
+
+
+def delete_command(message: Message, delay: float = 1.0) -> None:
+    """Remove the user's command message (needs the bot's delete-messages right)."""
+    if AUTO_DELETE_COMMANDS:
+        schedule_delete(message, delay)
+
+
+async def reply_temp(message: Message, text: str, delay: float | None = None, **kwargs) -> Message:
+    """Reply, then auto-delete the reply in groups/channels (private chats untouched)."""
+    msg = await message.reply_text(text, **kwargs)
+    schedule_delete(msg, delay if delay is not None else TEMP_MESSAGE_SECONDS)
+    return msg
+
+
+async def send_temp(chat_id: int, text: str, delay: float = TEMP_MESSAGE_SECONDS) -> None:
+    try:
+        msg = await app.send_message(chat_id, text)
+        spawn(_delete_after(chat_id, msg.id, delay))
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Temp message failed: %s", type(exc).__name__)
+
+
+def _is_already_joined(exc: Exception) -> bool:
+    return "already joined" in str(exc).lower() or type(exc).__name__ == "AlreadyJoinedError"
+
+
+async def janitor() -> None:
+    """Periodic housekeeping so nothing piles up on disk or in memory."""
+    while True:
+        await asyncio.sleep(JANITOR_INTERVAL)
+        try:
+            protected = set()
+            for f in CURRENT_FILES.values():
+                try:
+                    protected.add(Path(f).resolve())
+                except OSError:
+                    pass
+            removed = cleanup_temp_files(protected=protected)
+            now = time.monotonic()
+            for k in [k for k, v in RATE_LIMITS.items() if now - v > 3600]:
+                RATE_LIMITS.pop(k, None)
+            if removed:
+                LOGGER.info("Janitor removed %s stale files", removed)
+        except Exception:  # noqa: BLE001
+            LOGGER.exception("Janitor failed")
+
+
+async def purge_stale_now_playing() -> None:
+    """Delete now-playing panels left over from a previous run (their buttons are dead)."""
+    conn = db_connect()
+    try:
+        rows = conn.execute("SELECT key, value FROM settings WHERE key LIKE 'np:%'").fetchall()
+    finally:
+        conn.close()
+    for row in rows:
+        try:
+            chat_id = int(row["key"].split(":", 1)[1])
+            await app.delete_messages(chat_id, int(row["value"]))
+        except Exception:  # noqa: BLE001
+            pass
+        db_delete_setting(row["key"])
 
 
 def readable_time(seconds: int) -> str:
@@ -724,12 +828,14 @@ async def update_now_playing(chat_id: int, row: sqlite3.Row) -> None:
     try:
         msg = await app.send_message(chat_id, text, reply_markup=control_keyboard())
         NOW_PLAYING[chat_id] = msg.id
+        db_set_setting(f"np:{chat_id}", str(msg.id))
     except RPCError as exc:
         LOGGER.warning("Now playing message failed: %s", type(exc).__name__)
 
 
 async def clear_now_playing(chat_id: int) -> None:
     msg_id = NOW_PLAYING.pop(chat_id, None)
+    db_delete_setting(f"np:{chat_id}")
     if msg_id:
         try:
             await app.delete_messages(chat_id, msg_id)
@@ -747,6 +853,7 @@ async def leave_and_clear(chat_id: int) -> None:
             await pytgcalls.leave_group_call(chat_id)
         except Exception:
             pass
+    IN_CALL.discard(chat_id)
 
 
 async def start_next(chat_id: int) -> bool:
@@ -773,7 +880,7 @@ async def start_next(chat_id: int) -> bool:
             try:
                 file_path = await download_one(row["url"])
                 stream = AudioPiped(file_path, audio_parameters=HighQualityAudio())
-                had_stream = chat_id in CURRENT_FILES
+                had_stream = chat_id in IN_CALL
 
                 try:
                     if had_stream:
@@ -792,7 +899,13 @@ async def start_next(chat_id: int) -> bool:
                             except Exception as exc:
                                 last_exc = exc
                                 msg = str(exc)
-                                participant_missing = "PARTICIPANT_JOIN_MISSING" in msg
+                                low_msg = msg.lower()
+                                participant_missing = (
+                                    "PARTICIPANT_JOIN_MISSING" in msg
+                                    or "not in group call" in low_msg
+                                    or "not joined" in low_msg
+                                    or type(exc).__name__ == "NotInGroupCallError"
+                                )
                                 if not participant_missing or attempt >= 2:
                                     raise
                                 LOGGER.warning(
@@ -834,6 +947,14 @@ async def start_next(chat_id: int) -> bool:
                                 break
                             except Exception as exc:
                                 last_exc = exc
+                                if _is_already_joined(exc):
+                                    # Assistant is already in the call: just switch the stream.
+                                    try:
+                                        await pytgcalls.change_stream(chat_id, stream)
+                                        joined = True
+                                        break
+                                    except Exception as exc2:  # noqa: BLE001
+                                        last_exc = exc2
                                 LOGGER.warning(
                                     "Voice-chat join failed (attempt %s/3): %s",
                                     attempt + 1,
@@ -848,16 +969,16 @@ async def start_next(chat_id: int) -> bool:
                     queue_finish(row_id)
                     cleanup_file(file_path)
                     await clear_now_playing(chat_id)
+                    IN_CALL.discard(chat_id)
                     LOGGER.warning("Voice call failed: %s", type(exc).__name__)
-                    try:
-                        await app.send_message(
-                            chat_id,
-                            "تعذر تشغيل المكالمة. تأكد من فتح Voice Chat أو Live Stream ومن صلاحيات المساعد.",
-                        )
-                    except Exception:
-                        pass
+                    await send_temp(
+                        chat_id,
+                        "تعذر تشغيل المكالمة. تأكد من فتح Voice Chat أو Live Stream ومن صلاحيات المساعد.",
+                        ERROR_MESSAGE_SECONDS,
+                    )
                     return False
 
+                IN_CALL.add(chat_id)
                 old = CURRENT_FILES.get(chat_id)
                 CURRENT_FILES[chat_id] = file_path
                 if old and old != file_path:
@@ -869,13 +990,11 @@ async def start_next(chat_id: int) -> bool:
                 queue_finish(row_id)
                 cleanup_file(file_path)
                 LOGGER.exception("start_next failed: %s", type(exc).__name__)
-                try:
-                    await app.send_message(
-                        chat_id,
-                        f"فشل تشغيل المقطع.\n\nالخطأ: `{format_error(exc)}`",
-                    )
-                except Exception:
-                    pass
+                await send_temp(
+                    chat_id,
+                    f"فشل تشغيل المقطع.\n\nالخطأ: `{format_error(exc)}`",
+                    ERROR_MESSAGE_SECONDS,
+                )
                 # Continue to the next queued item instead of recursively calling
                 # start_next while its own lock is still held.
                 continue
@@ -893,10 +1012,15 @@ async def ensure_call_permissions(message: Message) -> tuple[bool, str]:
 
 @app.on_message(filters.command("start") & ~filters.forwarded)
 async def start_handler(_, message: Message):
-    await message.reply_text(
-        f"أهلًا {message.from_user.mention if message.from_user else 'بك'}.\n\n"
-        f"أنا {BOT_NAME}. أرسل اسم المقطع أو رابطه لتشغيله.\n\n"
-        f"قناة المطور: @{DEVELOPER_CHANNEL}",
+    delete_command(message, 2)
+    await reply_temp(
+        message,
+        (
+            f"أهلًا {message.from_user.mention if message.from_user else 'بك'}.\n\n"
+            f"أنا {BOT_NAME}. أرسل اسم المقطع أو رابطه لتشغيله.\n\n"
+            f"قناة المطور: @{DEVELOPER_CHANNEL}"
+        ),
+        60,
         reply_markup=support_keyboard(),
     )
 
@@ -907,6 +1031,8 @@ async def ping_handler(_, message: Message):
     msg = await message.reply_text("جارِ الفحص...")
     latency = (time.perf_counter() - started) * 1000
     await msg.edit_text(f"{BOT_NAME}\n\nزمن الاستجابة: `{latency:.0f} ms`\nمدة التشغيل: `{readable_time(int(time.time() - START_TIME))}`")
+    schedule_delete(msg, 30)
+    delete_command(message, 2)
 
 
 PLAY_REGEX = r"^(play|vplay|p|شغل|تشغيل)(?:\s+(.+))?$"
@@ -914,6 +1040,13 @@ PLAY_REGEX = r"^(play|vplay|p|شغل|تشغيل)(?:\s+(.+))?$"
 
 @app.on_message((filters.group | filters.channel) & filters.regex(PLAY_REGEX, re.I))
 async def play_handler(_, message: Message):
+    try:
+        await _play_impl(message)
+    finally:
+        delete_command(message)
+
+
+async def _play_impl(message: Message) -> None:
     chat_id = message.chat.id
     if not await authorize_chat(chat_id, str(message.chat.type)):
         return
@@ -922,31 +1055,33 @@ async def play_handler(_, message: Message):
         key = (user_id, "play")
         now = time.monotonic()
         if now - RATE_LIMITS.get(key, 0) < PLAY_COOLDOWN:
-            return await message.reply_text("تمهل قليلًا ثم أرسل الطلب مرة أخرى.")
+            return await reply_temp(message, "تمهل قليلًا ثم أرسل الطلب مرة أخرى.")
         RATE_LIMITS[key] = now
     ok, reason = await ensure_call_permissions(message)
     if not ok:
-        return await message.reply_text(reason)
+        return await reply_temp(message, reason)
     if queue_count(chat_id) >= MAX_QUEUE_PER_CHAT:
-        return await message.reply_text(f"قائمة الانتظار ممتلئة. الحد الحالي {MAX_QUEUE_PER_CHAT} مقطع.")
+        return await reply_temp(message, f"قائمة الانتظار ممتلئة. الحد الحالي {MAX_QUEUE_PER_CHAT} مقطع.")
     query = (message.matches[0].group(2) or "").strip() if message.matches else ""
     if not query and message.reply_to_message:
         query = (message.reply_to_message.text or message.reply_to_message.caption or "").strip()
     if not query:
-        return await message.reply_text("أرسل اسم المقطع أو رابطه بعد الأمر.")
-    status = await message.reply_text("جاري تجهيز الطلب...")
+        return await reply_temp(message, "أرسل اسم المقطع أو رابطه بعد الأمر.")
+    status = await reply_temp(message, "جاري تجهيز الطلب...", 120)
     try:
         url, title, video_id, duration = await resolve_query(query)
         queue_id = queue_add(chat_id, url, video_id, title, duration, requester, user_id)
-        current = CURRENT_FILES.get(chat_id)
+        current = CURRENT_FILES.get(chat_id) or chat_lock(chat_id).locked()
         if current:
             pos = queue_count(chat_id)
             await status.edit_text(f"تمت إضافة المقطع إلى قائمة الانتظار.\nالترتيب: `{pos}`")
+            schedule_delete(status, TEMP_MESSAGE_SECONDS)
         else:
             await status.delete()
             await start_next(chat_id)
     except Exception as exc:
         await status.edit_text(f"فشل تجهيز المقطع.\n\nالخطأ: `{format_error(exc)}`")
+        schedule_delete(status, ERROR_MESSAGE_SECONDS)
 
 
 async def is_admin_for_command(message: Message) -> bool:
@@ -967,18 +1102,25 @@ async def is_admin_for_command(message: Message) -> bool:
 
 
 async def handle_control(message: Message, action: str) -> None:
+    try:
+        await _handle_control_impl(message, action)
+    finally:
+        delete_command(message)
+
+
+async def _handle_control_impl(message: Message, action: str) -> None:
     if not await is_admin_for_command(message):
-        return await message.reply_text("هذا الأمر متاح للمشرفين فقط.")
+        return await reply_temp(message, "هذا الأمر متاح للمشرفين فقط.")
     chat_id = message.chat.id
     if not pytgcalls:
-        return await message.reply_text("حساب المساعد غير متصل.")
+        return await reply_temp(message, "حساب المساعد غير متصل.")
     try:
         if action == "pause":
             await pytgcalls.pause_stream(chat_id)
-            return await message.reply_text("تم إيقاف التشغيل مؤقتًا.")
+            return await reply_temp(message, "تم إيقاف التشغيل مؤقتًا.")
         if action == "resume":
             await pytgcalls.resume_stream(chat_id)
-            return await message.reply_text("تم استكمال التشغيل.")
+            return await reply_temp(message, "تم استكمال التشغيل.")
         if action == "skip":
             # Keep the current stream alive while the next item is downloaded.
             # start_next() will use change_stream() and then remove the old file.
@@ -992,10 +1134,10 @@ async def handle_control(message: Message, action: str) -> None:
             return
         if action == "stop":
             await leave_and_clear(chat_id)
-            return await message.reply_text("تم إنهاء التشغيل ومسح قائمة الانتظار.")
+            return await reply_temp(message, "تم إنهاء التشغيل ومسح قائمة الانتظار.")
     except Exception as exc:
         LOGGER.exception("Control action failed: %s", type(exc).__name__)
-        await message.reply_text(f"تعذر تنفيذ الأمر.\n\n`{format_error(exc)}`")
+        await reply_temp(message, f"تعذر تنفيذ الأمر.\n\n`{format_error(exc)}`")
 
 
 @app.on_message((filters.group | filters.channel) & filters.regex(r"^(pause|اوكف)$", re.I))
@@ -1021,17 +1163,17 @@ async def stop_handler(_, message: Message):
 @app.on_message(filters.command("song"))
 async def song_handler(_, message: Message):
     if not message.from_user:
-        return await message.reply_text("هذا الأمر يجب إرساله من حساب مستخدم أو من محادثة خاصة.")
+        return await reply_temp(message, "هذا الأمر يجب إرساله من حساب مستخدم أو من محادثة خاصة.")
     user_id = message.from_user.id
     now = time.monotonic()
     key = (user_id, "song")
     if user_id not in SUDO_USERS and now - RATE_LIMITS.get(key, 0) < SONG_COOLDOWN:
-        return await message.reply_text("تمهل قليلًا ثم أرسل الطلب مرة أخرى.")
+        return await reply_temp(message, "تمهل قليلًا ثم أرسل الطلب مرة أخرى.")
     RATE_LIMITS[key] = now
     query = message.text.split(None, 1)[1].strip() if len(message.text.split(None, 1)) > 1 else ""
     if not query:
-        return await message.reply_text("اكتب اسم الأغنية بعد الأمر.")
-    status = await message.reply_text("جاري تجهيز الملف...")
+        return await reply_temp(message, "اكتب اسم الأغنية بعد الأمر.")
+    status = await reply_temp(message, "جاري تجهيز الملف...", 120)
     path = None
     try:
         url, title, video_id, duration = await resolve_query(query)
@@ -1046,8 +1188,10 @@ async def song_handler(_, message: Message):
         await status.delete()
     except Exception as exc:
         await status.edit_text(f"فشل إرسال المقطع.\n\nالخطأ: `{format_error(exc)}`")
+        schedule_delete(status, ERROR_MESSAGE_SECONDS)
     finally:
         cleanup_file(path)
+        delete_command(message, 2)
 
 
 @app.on_message(filters.command("بحث"))
@@ -1056,14 +1200,14 @@ async def search_handler(_, message: Message):
         return
     query = message.text.split(None, 1)[1].strip() if len(message.text.split(None, 1)) > 1 else ""
     if not query:
-        return await message.reply_text("اكتب كلمة البحث.")
+        return await reply_temp(message, "اكتب كلمة البحث.")
     query = query[:SEARCH_MAX_LEN]
     now = time.monotonic()
     key = (message.from_user.id, "search")
     if message.from_user.id not in SUDO_USERS and now - RATE_LIMITS.get(key, 0) < SEARCH_COOLDOWN:
-        return await message.reply_text("تمهل قليلًا ثم أعد البحث.")
+        return await reply_temp(message, "تمهل قليلًا ثم أعد البحث.")
     RATE_LIMITS[key] = now
-    status = await message.reply_text("جاري البحث...")
+    status = await reply_temp(message, "جاري البحث...", 120)
     try:
         source_note = ""
         try:
@@ -1088,8 +1232,12 @@ async def search_handler(_, message: Message):
             url = item_url(item)
             lines.append(f"{i}. {title}\nالمدة: `{duration}`\nالرابط: {url}")
         await status.edit_text(source_note + "\n\n".join(lines), disable_web_page_preview=True)
+        schedule_delete(status, SEARCH_RESULT_SECONDS)
     except Exception as exc:
         await status.edit_text(f"فشل البحث.\n\nالخطأ: `{format_error(exc)}`")
+        schedule_delete(status, ERROR_MESSAGE_SECONDS)
+    finally:
+        delete_command(message, 2)
 
 
 @app.on_callback_query(filters.regex(r"^(pause_cb|resume_cb|skip_cb|end_cb|close)$"))
@@ -1121,7 +1269,7 @@ async def callback_controls(_, query: CallbackQuery):
     await query.answer()
 
     if not pytgcalls:
-        return await query.message.reply_text("حساب المساعد غير متصل.")
+        return await send_temp(chat_id, "حساب المساعد غير متصل.")
     try:
         if action == "pause":
             await pytgcalls.pause_stream(chat_id)
@@ -1141,10 +1289,10 @@ async def callback_controls(_, query: CallbackQuery):
         else:
             await leave_and_clear(chat_id)
             text = "تم إنهاء التشغيل ومسح قائمة الانتظار."
-        await query.message.reply_text(text)
+        await send_temp(chat_id, text)
     except Exception as exc:
         LOGGER.exception("Callback control failed: %s", type(exc).__name__)
-        await query.message.reply_text(f"تعذر تنفيذ الأمر.\n\n`{format_error(exc)}`")
+        await send_temp(chat_id, f"تعذر تنفيذ الأمر.\n\n`{format_error(exc)}`", ERROR_MESSAGE_SECONDS)
 
 
 @app.on_message(filters.command("المساعد") & filters.user(OWNER_ID))
@@ -1296,6 +1444,7 @@ async def on_call_closed(_, update: Any) -> None:
         return
     old = CURRENT_FILES.pop(chat_id, None)
     cleanup_file(old)
+    IN_CALL.discard(chat_id)
     # Keep queued URLs so a transient call close does not erase the user's list.
     await clear_now_playing(chat_id)
 
@@ -1313,6 +1462,8 @@ async def startup() -> None:
     session = saved_session()
     if session:
         await start_assistant(session)
+    await purge_stale_now_playing()
+    spawn(janitor())
     LOGGER.info("%s started as @%s", BOT_NAME, BOT_USERNAME or "-")
 
 
@@ -1326,6 +1477,9 @@ async def shutdown() -> None:
             except Exception:
                 pass
     LOGIN_STATE.clear()
+    for task in list(_BG_TASKS):
+        task.cancel()
+    IN_CALL.clear()
     for chat_id in list(CURRENT_FILES):
         old = CURRENT_FILES.pop(chat_id, None)
         cleanup_file(old)
