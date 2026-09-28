@@ -39,6 +39,14 @@ except Exception as exc:
 else:
     PYTGCALLS_IMPORT_ERROR = None
 
+try:
+    from pytgcalls.types import AudioVideoPiped, HighQualityVideo, LowQualityVideo, MediumQualityVideo
+except Exception as _video_exc:  # noqa: BLE001
+    AudioVideoPiped = HighQualityVideo = LowQualityVideo = MediumQualityVideo = None
+    VIDEO_IMPORT_ERROR = repr(_video_exc)
+else:
+    VIDEO_IMPORT_ERROR = None
+
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOADS_DIR = BASE_DIR / "downloads"
 CACHE_DIR = BASE_DIR / "cache"
@@ -248,6 +256,15 @@ def queue_finish(row_id: int) -> None:
         conn.close()
 
 
+def queue_requeue(row_id: int) -> None:
+    conn = db_connect()
+    try:
+        conn.execute("UPDATE queue SET status='queued' WHERE id=?", (row_id,))
+        conn.commit()
+    finally:
+        conn.close()
+
+
 def queue_clear(chat_id: int) -> None:
     conn = db_connect()
     try:
@@ -265,7 +282,11 @@ def cleanup_file(path: str | Path | None) -> None:
     if not path:
         return
     try:
-        Path(path).unlink(missing_ok=True)
+        p = Path(path)
+        p.unlink(missing_ok=True)
+        if p.suffix != ".mkv":
+            # merged audio+video file created for the owner's looping video
+            p.with_suffix(".vid.mkv").unlink(missing_ok=True)
     except OSError as exc:
         LOGGER.warning("Could not remove temporary file: %s", type(exc).__name__)
 
@@ -361,6 +382,7 @@ async def janitor() -> None:
             for f in CURRENT_FILES.values():
                 try:
                     protected.add(Path(f).resolve())
+                    protected.add(Path(f).with_suffix(".vid.mkv").resolve())
                 except OSError:
                     pass
             removed = cleanup_temp_files(protected=protected)
@@ -562,6 +584,7 @@ def ytdlp_base(clients: list[str] | None = None) -> dict[str, Any]:
         "retries": 2,
         "fragment_retries": 2,
         "socket_timeout": 20,
+        "noprogress": True,
         "js_runtimes": {"node": {}},
         "extractor_args": {
             "youtube": {"player_client": clients},
@@ -592,14 +615,17 @@ def _with_clients(fn):
     """Try each proxy (if several are configured), and inside it each client profile."""
     attempts = min(3, len(YTDLP_PROXIES)) if len(YTDLP_PROXIES) > 1 else 1
     last: Exception | None = None
-    for _ in range(attempts):
+    for attempt in range(attempts):
         try:
             return _with_clients_once(fn)
         except Exception as exc:  # noqa: BLE001
             last = exc
             if not _is_bot_check(exc):
                 raise
-            LOGGER.warning("Bot check hit; retrying with another proxy")
+            if attempt + 1 < attempts:
+                LOGGER.warning("Bot check hit; retrying with another proxy")
+            else:
+                LOGGER.warning("Bot check hit (YouTube blocked this IP)")
     assert last is not None
     raise last
 
@@ -645,7 +671,7 @@ def download_audio(url: str) -> str:
 
     def run(clients: list[str]) -> None:
         if is_soundcloud_url(url):
-            opts = {"quiet": True, "no_warnings": True, "noplaylist": True, "retries": 2, "socket_timeout": 20}
+            opts = {"quiet": True, "no_warnings": True, "noprogress": True, "noplaylist": True, "retries": 2, "socket_timeout": 20}
         else:
             opts = ytdlp_base(clients)
         opts.update(
@@ -736,11 +762,42 @@ async def _yt_lookup(query: str) -> tuple[str, dict[str, Any]]:
     return url, info
 
 
+def search_variants(title: str) -> list[str]:
+    """Build progressively simpler search texts from a (YouTube) title.
+
+    Long titles with "(Official Video)", emojis, "|" etc. often return nothing
+    on SoundCloud, so we also try a cleaned title and shorter prefixes.
+    """
+    raw = re.sub(r"\s+", " ", title or "").strip()
+    t = re.sub(r"[\(\[\{【（].*?[\)\]\}】）]", " ", raw)
+    t = re.sub(
+        r"(?i)\b(official|video|music|lyrics?|audio|mv|hd|4k|hq|clip|remastered|"
+        r"كلمات|حصريا|حصرياً|فيديو كليب|كليب)\b",
+        " ",
+        t,
+    )
+    t = re.sub(r"[^\w\s\-&.]", " ", t, flags=re.UNICODE)  # drops emojis, |, quotes...
+    t = re.sub(r"\s+", " ", t).strip(" -–—._")
+    words = t.split()
+    variants: list[str] = []
+    for cand in (raw, t, " ".join(words[:6]), " ".join(words[:4])):
+        cand = cand.strip()
+        if len(cand) >= 2 and cand not in variants:
+            variants.append(cand)
+    return variants
+
+
 async def _sc_lookup(text: str) -> tuple[str, dict[str, Any]]:
-    async with SEARCH_SEMAPHORE:
-        results = await asyncio.to_thread(soundcloud_search, text, 1)
-    item = results[0]
-    return item_url(item), item
+    last_exc: Exception | None = None
+    for variant in search_variants(text):
+        try:
+            async with SEARCH_SEMAPHORE:
+                results = await asyncio.to_thread(soundcloud_search, variant, 1)
+            item = results[0]
+            return item_url(item), item
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+    raise last_exc or RuntimeError("SoundCloud search returned no results")
 
 
 async def resolve_query(query: str) -> tuple[str, str, str, int]:
@@ -856,6 +913,213 @@ async def leave_and_clear(chat_id: int) -> None:
     IN_CALL.discard(chat_id)
 
 
+# ---------------------------------------------------------------------------
+# Owner-defined looping video / GIF / image shown in the voice chat while a
+# track plays. The owner sends the media to the bot in private with /setvideo.
+# The media is converted once to a small looping clip; for every track it is
+# looped (stream copy, no re-encoding) and merged with the track's audio.
+# ---------------------------------------------------------------------------
+VIDEO_DIR = BASE_DIR / "video_loop"  # not touched by the temp-file cleaners
+VIDEO_DIR.mkdir(parents=True, exist_ok=True)
+VIDEO_LOOP_FILE = VIDEO_DIR / "loop.mp4"
+FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
+VIDEO_QUALITY = os.getenv("VIDEO_QUALITY", "low").strip().lower()  # low | medium | high
+VIDEO_SOURCE_MAX_MB = int(os.getenv("VIDEO_SOURCE_MAX_MB", "30"))
+VIDEO_LOOP_MAX_SECONDS = int(os.getenv("VIDEO_LOOP_MAX_SECONDS", "20"))
+VIDEO_MAX_TRACK_MINUTES = int(os.getenv("VIDEO_MAX_TRACK_MINUTES", "40"))
+_VIDEO_SIZES = {"low": (640, 360, 15), "medium": (854, 480, 20), "high": (1280, 720, 24)}
+NO_VIDEO_ROWS: set[int] = set()  # tracks that already failed once in video mode
+
+
+def video_enabled() -> bool:
+    return (
+        AudioVideoPiped is not None
+        and db_get_setting("video_enabled") == "1"
+        and VIDEO_LOOP_FILE.exists()
+    )
+
+
+def _video_params():
+    cls = {"low": LowQualityVideo, "medium": MediumQualityVideo, "high": HighQualityVideo}.get(VIDEO_QUALITY) or LowQualityVideo
+    return cls()
+
+
+async def _run_ffmpeg(args: list[str], timeout: int) -> None:
+    proc = await asyncio.create_subprocess_exec(
+        FFMPEG_BIN, "-hide_banner", "-loglevel", "error", "-nostdin", "-y", *args,
+        stdout=asyncio.subprocess.DEVNULL,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    try:
+        _, err = await asyncio.wait_for(proc.communicate(), timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        raise RuntimeError("ffmpeg timed out")
+    if proc.returncode != 0:
+        raise RuntimeError("ffmpeg failed: " + err.decode(errors="replace")[-300:].strip())
+
+
+async def make_loop_video(source: str, is_image: bool) -> None:
+    """Convert the owner's media into a small H.264 loop clip (done once)."""
+    w, h, fps = _VIDEO_SIZES.get(VIDEO_QUALITY, _VIDEO_SIZES["low"])
+    if is_image:
+        fps = 5
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
+        f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={fps},format=yuv420p"
+    )
+    tmp = VIDEO_DIR / "loop.tmp.mp4"
+    pre = ["-loop", "1", "-framerate", str(fps)] if is_image else []
+    dur = "4" if is_image else str(VIDEO_LOOP_MAX_SECONDS)
+    enc = ["-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "28", "-g", str(fps * 2),
+           "-movflags", "+faststart", str(tmp)]
+    try:
+        try:
+            await _run_ffmpeg([*pre, "-i", source, "-t", dur, "-vf", vf, *enc], timeout=180)
+        except RuntimeError:
+            if not is_image:
+                raise
+            # Fallback for images: repeat the single frame with a filter instead of -loop.
+            vf2 = vf.replace(f",fps={fps},format=yuv420p", f",format=yuv420p,loop=loop=-1:size=1:start=0,fps={fps}")
+            await _run_ffmpeg(["-i", source, "-t", dur, "-vf", vf2, *enc], timeout=180)
+        if not tmp.exists() or tmp.stat().st_size == 0:
+            raise RuntimeError("empty output")
+        os.replace(tmp, VIDEO_LOOP_FILE)
+    finally:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+async def build_video_media(audio_path: str, duration: int) -> str | None:
+    """Loop the owner's clip for the whole track and merge it with the audio.
+
+    Stream copy only (no re-encoding), so it takes about a second. The result
+    ends exactly when the audio ends, so the stream-end event still works.
+    """
+    if not video_enabled():
+        return None
+    if duration and duration > VIDEO_MAX_TRACK_MINUTES * 60:
+        return None
+    out = Path(audio_path).with_suffix(".vid.mkv")
+    try:
+        await _run_ffmpeg(
+            ["-stream_loop", "-1", "-i", str(VIDEO_LOOP_FILE), "-i", audio_path,
+             "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "copy",
+             "-shortest", "-f", "matroska", str(out)],
+            timeout=180,
+        )
+        if out.exists() and out.stat().st_size > 0:
+            return str(out)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Video merge failed, using audio only: %s", str(exc)[:200])
+    try:
+        out.unlink(missing_ok=True)
+    except OSError:
+        pass
+    return None
+
+
+def _extract_media(m: Message | None):
+    """Return (kind, size, file_id) for an image / GIF / video message, else None."""
+    if not m:
+        return None
+    if m.animation:
+        return "video", m.animation.file_size or 0, m.animation.file_id
+    if m.video:
+        return "video", m.video.file_size or 0, m.video.file_id
+    if m.video_note:
+        return "video", m.video_note.file_size or 0, m.video_note.file_id
+    if m.photo:
+        return "image", m.photo.file_size or 0, m.photo.file_id
+    d = m.document
+    if d and d.mime_type:
+        if d.mime_type.startswith("video/") or d.mime_type == "image/gif":
+            return "video", d.file_size or 0, d.file_id
+        if d.mime_type.startswith("image/"):
+            return "image", d.file_size or 0, d.file_id
+    return None
+
+
+async def restore_loop_video() -> None:
+    """After a redeploy the local file is gone; rebuild it from the saved Telegram file_id."""
+    if db_get_setting("video_enabled") != "1" or VIDEO_LOOP_FILE.exists():
+        return
+    file_id = db_get_setting("video_file_id")
+    if not file_id:
+        return
+    src = None
+    try:
+        src = await app.download_media(file_id, file_name=str(VIDEO_DIR / f"src_{uuid.uuid4().hex}"))
+        await make_loop_video(str(src), db_get_setting("video_kind") == "image")
+        LOGGER.info("Restored the owner's loop video")
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Could not restore loop video: %s", str(exc)[:200])
+    finally:
+        cleanup_file(src)
+
+
+@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command(["setvideo", "تعيين_فيديو"]))
+async def setvideo_handler(_, message: Message):
+    if AudioVideoPiped is None:
+        return await message.reply_text(
+            "نسخة pytgcalls المثبتة لا تدعم بث الفيديو.\n" f"`{VIDEO_IMPORT_ERROR}`"
+        )
+    src = message if _extract_media(message) else message.reply_to_message
+    media = _extract_media(src)
+    if not media:
+        return await message.reply_text(
+            "أرسل صورة أو GIF أو فيديو قصيرًا مع التعليق /setvideo\n"
+            "أو ردّ على وسيط موجود بالأمر /setvideo"
+        )
+    kind, size, file_id = media
+    if size and size > VIDEO_SOURCE_MAX_MB * 1024 * 1024:
+        return await message.reply_text(f"الملف كبير جدًا. الحد الأقصى {VIDEO_SOURCE_MAX_MB} MB.")
+    status = await message.reply_text("جاري تجهيز الفيديو...")
+    tmp = None
+    try:
+        tmp = await app.download_media(src, file_name=str(VIDEO_DIR / f"src_{uuid.uuid4().hex}"))
+        await make_loop_video(str(tmp), kind == "image")
+        db_set_setting("video_file_id", file_id)
+        db_set_setting("video_kind", kind)
+        db_set_setting("video_enabled", "1")
+        await status.edit_text(
+            "تم تعيين الفيديو. سيظهر في المكالمة مع كل أغنية ويُعاد حتى تنتهي.\n"
+            "لإلغائه أرسل /delvideo"
+        )
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("setvideo failed: %s", str(exc)[:300])
+        await status.edit_text(f"تعذر تجهيز الفيديو.\n\n`{str(exc)[:400]}`")
+    finally:
+        cleanup_file(tmp)
+
+
+@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command(["delvideo", "حذف_فيديو"]))
+async def delvideo_handler(_, message: Message):
+    for key in ("video_enabled", "video_file_id", "video_kind"):
+        db_delete_setting(key)
+    try:
+        VIDEO_LOOP_FILE.unlink(missing_ok=True)
+    except OSError:
+        pass
+    await message.reply_text("تم حذف الفيديو. سيعود التشغيل بالصوت فقط.")
+
+
+@app.on_message(filters.private & filters.user(OWNER_ID) & filters.command(["videoinfo"]))
+async def videoinfo_handler(_, message: Message):
+    if AudioVideoPiped is None:
+        return await message.reply_text("بث الفيديو غير مدعوم في نسخة pytgcalls الحالية.")
+    if not video_enabled():
+        return await message.reply_text("لا يوجد فيديو معيّن. أرسل وسيطًا مع /setvideo")
+    kind = "صورة" if db_get_setting("video_kind") == "image" else "فيديو/GIF"
+    size_kb = VIDEO_LOOP_FILE.stat().st_size // 1024
+    w, h, fps = _VIDEO_SIZES.get(VIDEO_QUALITY, _VIDEO_SIZES["low"])
+    await message.reply_text(
+        f"الفيديو مفعّل\nالنوع: {kind}\nالجودة: {VIDEO_QUALITY} ({w}x{h})\nحجم المقطع: {size_kb} KB"
+    )
+
+
 async def start_next(chat_id: int) -> bool:
     """Download and start the next queued item without recursive retries.
 
@@ -876,10 +1140,26 @@ async def start_next(chat_id: int) -> bool:
             row_id = int(row["id"])
             queue_mark_playing(row_id)
             file_path: str | None = None
+            video_used = False
 
             try:
                 file_path = await download_one(row["url"])
-                stream = AudioPiped(file_path, audio_parameters=HighQualityAudio())
+                stream = None
+                if row_id not in NO_VIDEO_ROWS:
+                    merged = await build_video_media(file_path, int(row["duration"] or 0))
+                    if merged:
+                        try:
+                            stream = AudioVideoPiped(
+                                merged,
+                                audio_parameters=HighQualityAudio(),
+                                video_parameters=_video_params(),
+                            )
+                            video_used = True
+                        except Exception as vexc:  # noqa: BLE001
+                            LOGGER.warning("Could not build video stream: %s", str(vexc)[:200])
+                            cleanup_file(merged)
+                if stream is None:
+                    stream = AudioPiped(file_path, audio_parameters=HighQualityAudio())
                 had_stream = chat_id in IN_CALL
 
                 try:
@@ -987,6 +1267,14 @@ async def start_next(chat_id: int) -> bool:
                 return True
 
             except Exception as exc:
+                if video_used and row_id not in NO_VIDEO_ROWS:
+                    # Video mode failed: play the same track again, audio only.
+                    NO_VIDEO_ROWS.add(row_id)
+                    LOGGER.warning("Video stream failed (%s); retrying audio-only", type(exc).__name__)
+                    cleanup_file(file_path)
+                    queue_requeue(row_id)
+                    await send_temp(chat_id, "تعذر بث الفيديو، سيتم التشغيل بالصوت فقط.", ERROR_MESSAGE_SECONDS)
+                    continue
                 queue_finish(row_id)
                 cleanup_file(file_path)
                 LOGGER.exception("start_next failed: %s", type(exc).__name__)
@@ -1463,6 +1751,7 @@ async def startup() -> None:
     if session:
         await start_assistant(session)
     await purge_stale_now_playing()
+    await restore_loop_video()
     spawn(janitor())
     LOGGER.info("%s started as @%s", BOT_NAME, BOT_USERNAME or "-")
 
