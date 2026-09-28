@@ -10,12 +10,16 @@ from pyrogram import __version__ as PYROGRAM_VERSION
 from pyrogram.types import *
 from pyrogram.enums import *
 from pyrogram.errors import *
+PYTGCALLS_IMPORT_ERROR = None
 try:
     from pytgcalls import PyTgCalls, StreamType
     from pytgcalls.types import AudioPiped, HighQualityAudio, Update
     from pytgcalls.exceptions import NoActiveGroupCall, TelegramServerError, UnMuteNeeded
-except Exception:
+except Exception as exc:
     PyTgCalls = None
+    StreamType = AudioPiped = HighQualityAudio = Update = None
+    NoActiveGroupCall = TelegramServerError = UnMuteNeeded = Exception
+    PYTGCALLS_IMPORT_ERROR = repr(exc)
 import yt_dlp
 
 load_dotenv = None
@@ -111,7 +115,15 @@ async def start_assistant(session_string=None):
     await app2.start(); me=await app2.get_me()
     ASS_ID=me.id; ASS_NAME=(me.first_name+" "+(me.last_name or "")).strip(); ASS_USERNAME=me.username; ASS_MENTION=me.mention
     if PyTgCalls:
-        pytgcalls=PyTgCalls(app2); await pytgcalls.start()
+        try:
+            pytgcalls=PyTgCalls(app2)
+            await pytgcalls.start()
+            _register_pytgcalls_handlers()
+        except Exception as exc:
+            pytgcalls = None
+            LOGGER.exception("PyTgCalls failed to start: %s", exc)
+    elif PYTGCALLS_IMPORT_ERROR:
+        LOGGER.error("PyTgCalls unavailable: %s", PYTGCALLS_IMPORT_ERROR)
     return True
 
 async def stop_assistant():
@@ -1268,16 +1280,12 @@ async def ub_leave(_, message: Message):
         except:
             pass
 
-@pytgcalls.on_left()
-@pytgcalls.on_kicked()
-@pytgcalls.on_closed_voice_chat()
 async def swr_handler(_, chat_id: int):
     try:
         await _clear_(chat_id)
-    except:
+    except Exception:
         pass
 
-@pytgcalls.on_stream_end()
 async def on_stream_end(pytgcalls, update: Update):
     chat_id = update.chat_id
     get = fallendb.get(chat_id)
@@ -1309,6 +1317,18 @@ async def on_stream_end(pytgcalls, update: Update):
         await process.delete()
         await app.send_photo(chat_id=chat_id, photo=img, caption=f'**‹ : بدء التشغيل**\n\n**‹ : الاسم :** [{title[:27]}](https://t.me/{BOT_USERNAME}?start=info_{videoid})\n**‹ : المدة :** `{duration}` دقيقة\n**‹ : بواسطة :** {req_by}', reply_markup=buttons)
 
+
+def _register_pytgcalls_handlers():
+    """Register PyTgCalls callbacks only after the client instance exists."""
+    if pytgcalls is None:
+        return
+    try:
+        pytgcalls.on_left()(swr_handler)
+        pytgcalls.on_kicked()(swr_handler)
+        pytgcalls.on_closed_voice_chat()(swr_handler)
+        pytgcalls.on_stream_end()(on_stream_end)
+    except Exception as exc:
+        LOGGER.warning("PyTgCalls handler registration failed: %s", exc)
 
 async def run():
     await fallen_startup()
