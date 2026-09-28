@@ -413,90 +413,83 @@ async def stop_assistant() -> None:
     ASS_MENTION = ""
 
 
-YOUTUBE_CLIENTS = ("web_safari", "android_vr", "web_embedded", "tv", "default")
+# YouTube extraction is intentionally kept on one modern client instead of
+# cycling through many clients. Current yt-dlp guidance recommends mweb + a
+# PO Token Provider for GVS requests. This implementation never reads cookies.
+YOUTUBE_CLIENT = "mweb"
+YTDLP_POT_URL = os.getenv("YTDLP_POT_URL", "http://127.0.0.1:4416").strip()
 
 
-def ytdlp_base(client: str) -> dict[str, Any]:
-    opts: dict[str, Any] = {
+def ytdlp_base() -> dict[str, Any]:
+    """Return a single, cookie-free yt-dlp profile for Railway.
+
+    The Railway image starts the bgutil POT provider locally. If the provider
+    is not available, yt-dlp can still attempt extraction, but we do not fall
+    back to a burst of different clients which tends to trigger more bot
+    checks from YouTube.
+    """
+    return {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "retries": 2,
+        "fragment_retries": 2,
         "socket_timeout": 20,
-        "extractor_args": {"youtube": {"player_client": [client]}},
+        "js_runtimes": {"node": {}},
+        "extractor_args": {
+            "youtube": {"player_client": [YOUTUBE_CLIENT]},
+            "youtubepot-bgutilhttp": {"base_url": YTDLP_POT_URL},
+        },
     }
-    cookiefile = Path(os.getenv("YTDLP_COOKIES_FILE", "cookies.txt"))
-    if cookiefile.is_file():
-        opts["cookiefile"] = str(cookiefile)
-    return opts
 
 
 def youtube_info(url: str) -> dict[str, Any]:
-    last: Exception | None = None
-    for client in YOUTUBE_CLIENTS:
-        try:
-            opts = ytdlp_base(client)
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-        except Exception as exc:
-            last = exc
-            LOGGER.warning("YouTube metadata failed client=%s error=%s", client, str(exc)[:250])
-    raise last or RuntimeError("YouTube metadata unavailable")
+    opts = ytdlp_base()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        return ydl.extract_info(url, download=False)
 
 
 def youtube_search(query: str, limit: int = 4) -> list[dict[str, Any]]:
-    last: Exception | None = None
-    for client in YOUTUBE_CLIENTS:
-        try:
-            opts = ytdlp_base(client)
-            opts["extract_flat"] = True
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
-            entries = [x for x in (data.get("entries") or []) if x]
-            if entries:
-                return entries[:limit]
-        except Exception as exc:
-            last = exc
-            LOGGER.warning("YouTube search failed client=%s error=%s", client, str(exc)[:250])
-    raise last or RuntimeError("YouTube search unavailable")
+    opts = ytdlp_base()
+    opts["extract_flat"] = True
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        data = ydl.extract_info(f"ytsearch{limit}:{query}", download=False)
+    entries = [x for x in (data.get("entries") or []) if x]
+    if not entries:
+        raise RuntimeError("YouTube search returned no results")
+    return entries[:limit]
 
 
 def choose_audio_format() -> str:
-    # A moderate bitrate is enough for voice-chat music and avoids unnecessarily
-    # large temporary files. yt-dlp will fall back if the exact filter is absent.
-    return "bestaudio[abr<=160]/bestaudio/best"
+    # Prefer the audio-only stream and fall back to the best available format.
+    return "bestaudio/best"
 
 
 def download_audio(url: str) -> str:
-    last: Exception | None = None
     unique = uuid.uuid4().hex
-    attempts = ("web_safari", "android_vr", "web_embedded", "tv", "default")
-    for client in attempts:
-        try:
-            opts = ytdlp_base(client)
-            opts.update(
-                {
-                    "format": choose_audio_format(),
-                    "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
-                    "overwrites": True,
-                }
-            )
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                ydl.extract_info(url, download=True)
-            files = list(DOWNLOADS_DIR.glob(f"{unique}.*"))
-            if not files:
-                raise FileNotFoundError("Downloaded file was not found")
-            path = files[0]
-            if path.stat().st_size > MAX_AUDIO_MB * 1024 * 1024:
-                cleanup_file(path)
-                raise RuntimeError(f"الملف أكبر من الحد المسموح ({MAX_AUDIO_MB} MB).")
-            return str(path)
-        except Exception as exc:
-            last = exc
-            for p in DOWNLOADS_DIR.glob(f"{unique}.*"):
-                cleanup_file(p)
-            LOGGER.warning("YouTube download failed client=%s error=%s", client, str(exc)[:300])
-    raise last or RuntimeError("Audio download failed")
+    opts = ytdlp_base()
+    opts.update(
+        {
+            "format": choose_audio_format(),
+            "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
+            "overwrites": True,
+        }
+    )
+    try:
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            ydl.extract_info(url, download=True)
+        files = list(DOWNLOADS_DIR.glob(f"{unique}.*"))
+        if not files:
+            raise FileNotFoundError("Downloaded file was not found")
+        path = files[0]
+        if path.stat().st_size > MAX_AUDIO_MB * 1024 * 1024:
+            cleanup_file(path)
+            raise RuntimeError(f"الملف أكبر من الحد المسموح ({MAX_AUDIO_MB} MB).")
+        return str(path)
+    except Exception:
+        for p in DOWNLOADS_DIR.glob(f"{unique}.*"):
+            cleanup_file(p)
+        raise
 
 
 async def resolve_query(query: str) -> tuple[str, str, str, int]:
@@ -530,9 +523,9 @@ def format_error(exc: Exception) -> str:
     if "requested format is not available" in low:
         return "يوتيوب لم يعرض صيغة صوت مناسبة لهذا الاتصال."
     if "403" in low or "forbidden" in low:
-        return "يوتيوب رفض تنزيل الملف من خادم Railway (403). جرّب رابطًا آخر أو وفّر cookies/طريقة مصادقة مناسبة."
+        return "يوتيوب رفض تنزيل الملف من خادم Railway (403). تم استخدام مسار PO Token بدون Cookies؛ جرّب المحاولة مرة أخرى."
     if "sign in" in low or "not a bot" in low or "cookies" in low or "po token" in low:
-        return "يوتيوب رفض طلب خادم Railway. قد تحتاج cookies أو معالجة PO Token حسب حالة الخادم."
+        return "يوتيوب طلب تحققًا من خادم Railway. تم تفعيل مسار PO Token بدون Cookies؛ إذا استمر الخطأ فالمشكلة من استجابة YouTube لهذا الـIP."
     return text[:700]
 
 
