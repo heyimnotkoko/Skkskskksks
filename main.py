@@ -68,7 +68,7 @@ SUPPORT_CHANNEL=os.getenv("SUPPORT_CHANNEL", f"https://t.me/{DEVELOPER_CHANNEL}"
 SUDO_USERS=_int_list(os.getenv("SUDO_USERS", ""))
 AUTO_JOIN_CHATS=[x.lstrip("@").strip() for x in os.getenv("AUTO_JOIN_CHATS", "").replace(",", " ").split() if x.strip()]
 YTDLP_COOKIES_B64=os.getenv("YTDLP_COOKIES_B64", "").strip()
-YTDLP_USE_BGUTIL=os.getenv("YTDLP_USE_BGUTIL", "1").strip().lower() not in {"0", "false", "no", "off"}
+YTDLP_USE_BGUTIL=os.getenv("YTDLP_USE_BGUTIL", "0").strip().lower() not in {"0", "false", "no", "off"}
 BGUTIL_POT_URL=os.getenv("BGUTIL_POT_URL", "http://127.0.0.1:4416").strip()
 if YTDLP_COOKIES_B64:
     try:
@@ -363,9 +363,11 @@ def clean_url(url: str) -> str:
 # valid PO token can still leave yt-dlp with no directly downloadable audio
 # format. We therefore use a small ordered client/format fallback chain.
 YOUTUBE_CLIENTS = (
-    "mweb",       # preferred with BgUtils PO Token provider
-    "android_vr", # useful fallback on some datacenter IPs
-    "web_safari", # may expose HLS formats, especially with cookies
+    "web_safari", # HLS formats can work without a GVS PO Token
+    "android_vr",  # token-free fallback on many server IPs
+    "web_embedded",
+    "tv",
+    "mweb",        # use only if BgUtils is explicitly enabled
     "default",
 )
 
@@ -416,10 +418,14 @@ def _youtube_error_message(exc: Exception) -> str:
             )
         if YTDLP_USE_BGUTIL:
             return (
-                'يوتيوب رفض الطلب من الخادم. تم تفعيل BgUtils تلقائياً، '
-                'لكن مزود PO Token لم ينجح في هذه المحاولة.'
+                'يوتيوب رفض الطلب من الخادم. تمت تجربة طرق بديلة، '
+                'ثم محاولة BgUtils للحصول على PO Token، لكن لم تنجح هذه المحاولة.'
             )
-        return 'يوتيوب رفض الطلب من الخادم بسبب التحقق من المستخدم.'
+        return (
+            'يوتيوب رفض الطلب من خادم Railway. تمت تجربة web_safari وandroid_vr '
+            'وweb_embedded قبل اعتبار الطلب فاشلاً. لا حاجة لإضافة PO Token يدوياً '
+            'إلا إذا استمرت هذه المشكلة مع نفس الفيديو.'
+        )
 
     return msg[:1200]
 
@@ -458,13 +464,18 @@ def audio_dl(url: str) -> str:
 
     # Do not merely change the format against one client. A YouTube client
     # can expose only SABR/image formats, so we move to another client too.
+    # Prefer clients/formats that do not depend on a manually supplied PO Token.
+    # web_safari can expose HLS formats, while android_vr/web_embedded are useful
+    # token-free fallbacks. mweb+BgUtils is attempted only when explicitly enabled.
     attempts = [
+        ('web_safari', 'bestaudio[protocol^=m3u8]/bestaudio[protocol^=http]/bestaudio/best'),
+        ('web_safari', 'best[protocol^=m3u8]/best[protocol^=http]/best'),
+        ('android_vr', 'bestaudio[protocol^=http]/bestaudio/best'),
+        ('android_vr', 'best[protocol^=http]/best'),
+        ('web_embedded', 'bestaudio[protocol^=http]/bestaudio/best'),
+        ('web_embedded', 'best[protocol^=http]/best'),
+        ('tv', 'bestaudio[protocol^=http]/bestaudio/best'),
         ('mweb', 'bestaudio/best'),
-        ('mweb', 'best'),
-        ('android_vr', 'bestaudio/best'),
-        ('android_vr', 'best'),
-        ('web_safari', 'bestaudio/best'),
-        ('web_safari', 'best'),
         ('default', 'bestaudio/best'),
         ('default', 'best'),
     ]
