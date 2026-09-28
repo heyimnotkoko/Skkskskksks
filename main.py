@@ -80,6 +80,13 @@ StartTime=time.time()
 logging.basicConfig(format="[%(asctime)s - %(levelname)s] %(name)s: %(message)s", datefmt="%d-%b-%y %H:%M:%S", level=logging.INFO, stream=sys.stdout)
 logging.getLogger("pyrogram").setLevel(logging.ERROR); logging.getLogger("pytgcalls").setLevel(logging.ERROR)
 LOGGER=logging.getLogger("KroMusic")
+
+# Create one persistent event loop before creating Pyrogram clients.
+# Pyrogram binds internal async resources to the loop used by the client.
+# Do not use asyncio.run() later because it would create a second loop.
+MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(MAIN_LOOP)
+
 app=Client("KroMusic", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app2=None; pytgcalls=None
 SUDOERS=filters.user(); CURRENT_FILES={}; fallendb={}
@@ -1336,4 +1343,14 @@ async def run():
     await idle()
 
 if __name__ == "__main__":
-    asyncio.run(run())
+    try:
+        MAIN_LOOP.run_until_complete(run())
+    finally:
+        try:
+            MAIN_LOOP.run_until_complete(asyncio.sleep(0))
+        except Exception:
+            pass
+        try:
+            MAIN_LOOP.close()
+        except Exception:
+            pass
