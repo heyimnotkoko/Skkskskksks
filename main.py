@@ -67,6 +67,13 @@ logging.basicConfig(
 )
 LOGGER = logging.getLogger(BOT_NAME)
 
+# Pyrogram binds internal futures/tasks to the event loop that exists when the
+# Client is created. Keep one dedicated loop for the whole process so the
+# Client is never created on one loop and started on another (Railway/Python
+# 3.11 can otherwise raise "Future attached to a different loop").
+MAIN_LOOP = asyncio.new_event_loop()
+asyncio.set_event_loop(MAIN_LOOP)
+
 app = Client("KroMusic", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN)
 app2: Client | None = None
 pytgcalls = None
@@ -1051,6 +1058,13 @@ async def main() -> None:
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        MAIN_LOOP.run_until_complete(main())
     except KeyboardInterrupt:
         pass
+    finally:
+        try:
+            MAIN_LOOP.run_until_complete(asyncio.sleep(0))
+        except Exception:
+            pass
+        asyncio.set_event_loop(None)
+        MAIN_LOOP.close()
