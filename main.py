@@ -68,6 +68,8 @@ SUPPORT_CHANNEL=os.getenv("SUPPORT_CHANNEL", f"https://t.me/{DEVELOPER_CHANNEL}"
 SUDO_USERS=_int_list(os.getenv("SUDO_USERS", ""))
 AUTO_JOIN_CHATS=[x.lstrip("@").strip() for x in os.getenv("AUTO_JOIN_CHATS", "").replace(",", " ").split() if x.strip()]
 YTDLP_COOKIES_B64=os.getenv("YTDLP_COOKIES_B64", "").strip()
+YTDLP_USE_BGUTIL=os.getenv("YTDLP_USE_BGUTIL", "1").strip().lower() not in {"0", "false", "no", "off"}
+BGUTIL_POT_URL=os.getenv("BGUTIL_POT_URL", "http://127.0.0.1:4416").strip()
 if YTDLP_COOKIES_B64:
     try:
         COOKIES_FILE.write_bytes(base64.b64decode(YTDLP_COOKIES_B64, validate=True)); COOKIES_FILE.chmod(0o600)
@@ -357,8 +359,8 @@ def clean_url(url: str) -> str:
     return url
 
 def _common_opts() -> dict:
-    # YouTube changes its anti-bot requirements frequently. Keep the
-    # default client list lightweight and allow Railway ENV overrides.
+    # Prefer yt-dlp's normal clients unless the bundled BgUtils POT provider
+    # is enabled. With BgUtils, mweb receives a fresh PO Token automatically.
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -370,22 +372,23 @@ def _common_opts() -> dict:
     if config.COOKIES_FILE.is_file():
         opts['cookiefile'] = str(config.COOKIES_FILE)
 
-    # Optional PO Token support. A token is video/session dependent and
-    # should be supplied externally when YouTube requires it.
-    po_token = os.getenv('YTDLP_PO_TOKEN', '').strip()
-    if po_token:
+    if YTDLP_USE_BGUTIL:
+        # The bgutil plugin reads this provider and supplies per-video PO
+        # tokens. Do not hard-code a token in Railway variables.
         opts['extractor_args'] = {
             'youtube': {
-                'player_client': ['mweb', 'web_embedded'],
-                'po_token': [f'mweb.gvs+{po_token}'],
-            }
+                'player_client': ['mweb'],
+            },
+            'youtubepot-bgutilhttp': {
+                'base_url': [BGUTIL_POT_URL],
+            },
         }
     else:
-        # These clients currently avoid some of the web-client checks.
-        # yt-dlp will select usable formats from the available clients.
+        # Let yt-dlp choose its current default clients. This is safer than
+        # forcing a client that YouTube may have changed.
         opts['extractor_args'] = {
             'youtube': {
-                'player_client': ['android_vr', 'web_embedded', 'tv']
+                'player_client': ['default'],
             }
         }
 
@@ -400,9 +403,14 @@ def _youtube_error_message(exc: Exception) -> str:
                 'يوتيوب رفض الطلب من الخادم. ملف cookies موجود، '
                 'لكن قد تحتاج الجلسة إلى PO Token صالح.'
             )
+        if YTDLP_USE_BGUTIL:
+            return (
+                'يوتيوب رفض الطلب من الخادم. خدمة التحقق التلقائي لم تعمل أو لم تستطع '
+                'الحصول على PO Token. تأكد من تشغيل نسخة Docker المرفقة وإعادة التشغيل.'
+            )
         return (
             'يوتيوب رفض الطلب من الخادم بسبب التحقق من المستخدم. '
-            'أضف YTDLP_COOKIES_B64 إلى Railway، وقد تحتاج أيضًا إلى YTDLP_PO_TOKEN.'
+            'جرّب تشغيل YTDLP_USE_BGUTIL=1 مع نسخة Docker المرفقة.'
         )
     return msg[:1200]
 
