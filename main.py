@@ -358,9 +358,18 @@ def clean_url(url: str) -> str:
         return f"https://www.youtube.com/watch?v={query['v'][0]}"
     return url
 
-def _common_opts() -> dict:
-    # Prefer yt-dlp's normal clients unless the bundled BgUtils POT provider
-    # is enabled. With BgUtils, mweb receives a fresh PO Token automatically.
+# YouTube extraction notes:
+# YouTube may return SABR-only responses for some clients. In that case a
+# valid PO token can still leave yt-dlp with no directly downloadable audio
+# format. We therefore use a small ordered client/format fallback chain.
+YOUTUBE_CLIENTS = (
+    "mweb",       # preferred with BgUtils PO Token provider
+    "android_vr", # useful fallback on some datacenter IPs
+    "web_safari", # may expose HLS formats, especially with cookies
+    "default",
+)
+
+def _common_opts(client: str | None = None) -> dict:
     opts = {
         'quiet': True,
         'no_warnings': True,
@@ -372,92 +381,172 @@ def _common_opts() -> dict:
     if config.COOKIES_FILE.is_file():
         opts['cookiefile'] = str(config.COOKIES_FILE)
 
-    if YTDLP_USE_BGUTIL:
-        # The bgutil plugin reads this provider and supplies per-video PO
-        # tokens. Do not hard-code a token in Railway variables.
+    if client:
         opts['extractor_args'] = {
             'youtube': {
-                'player_client': ['mweb'],
-            },
-            'youtubepot-bgutilhttp': {
-                'base_url': [BGUTIL_POT_URL],
-            },
-        }
-    else:
-        # Let yt-dlp choose its current default clients. This is safer than
-        # forcing a client that YouTube may have changed.
-        opts['extractor_args'] = {
-            'youtube': {
-                'player_client': ['default'],
+                'player_client': [client],
             }
         }
 
+        # BgUtils is specifically useful for the mweb GVS PO Token.
+        if client == 'mweb' and YTDLP_USE_BGUTIL:
+            opts['extractor_args']['youtubepot-bgutilhttp'] = {
+                'base_url': [BGUTIL_POT_URL],
+            }
+
     return opts
+
 
 def _youtube_error_message(exc: Exception) -> str:
     msg = str(exc)
     low = msg.lower()
+
+    if 'requested format is not available' in low:
+        return (
+            'يوتيوب لم يعرض صيغة صوت قابلة للتنزيل لهذا الاتصال. '
+            'تمت تجربة أكثر من طريقة اتصال تلقائياً؛ '
+            'إذا استمر الخطأ فقد تكون الصيغ محجوبة عن IP الخادم الحالي.'
+        )
+
     if 'sign in to confirm' in low or 'not a bot' in low or 'cookies' in low:
         if config.COOKIES_FILE.is_file():
             return (
                 'يوتيوب رفض الطلب من الخادم. ملف cookies موجود، '
-                'لكن قد تحتاج الجلسة إلى PO Token صالح.'
+                'لكن YouTube قد يتطلب جلسة صالحة أو PO Token.'
             )
         if YTDLP_USE_BGUTIL:
             return (
-                'يوتيوب رفض الطلب من الخادم. خدمة التحقق التلقائي لم تعمل أو لم تستطع '
-                'الحصول على PO Token. تأكد من تشغيل نسخة Docker المرفقة وإعادة التشغيل.'
+                'يوتيوب رفض الطلب من الخادم. تم تفعيل BgUtils تلقائياً، '
+                'لكن مزود PO Token لم ينجح في هذه المحاولة.'
             )
-        return (
-            'يوتيوب رفض الطلب من الخادم بسبب التحقق من المستخدم. '
-            'جرّب تشغيل YTDLP_USE_BGUTIL=1 مع نسخة Docker المرفقة.'
-        )
+        return 'يوتيوب رفض الطلب من الخادم بسبب التحقق من المستخدم.'
+
     return msg[:1200]
 
 
-def _audio_opts() -> dict:
-    opts = _common_opts()
+def _audio_opts(client: str, fmt: str) -> dict:
+    opts = _common_opts(client)
     opts.update({
-        # Do not force m4a: some YouTube client responses expose audio only
-        # as webm/opus or expose a combined audio+video format.
-        # `bestaudio/best` keeps an audio-only preference while falling back
-        # to any playable format instead of raising "Requested format is not available".
-        'format': 'bestaudio/best',
+        # Prefer audio-only, but fall back to a combined playable stream.
+        'format': fmt,
         'outtmpl': str(config.DOWNLOADS_DIR / '%(id)s.%(ext)s'),
         'overwrites': True,
         'format_sort': ['abr', 'res', 'fps'],
     })
     return opts
 
-def audio_dl(url: str) -> str:
-    cleaned_url = clean_url(url)
-    with yt_dlp.YoutubeDL(_audio_opts()) as ydl:
+
+def _download_with_ytdlp(cleaned_url: str, client: str, fmt: str) -> str:
+    with yt_dlp.YoutubeDL(_audio_opts(client, fmt)) as ydl:
         info = ydl.extract_info(cleaned_url, download=True)
         path = Path(ydl.prepare_filename(info))
+
         if not path.is_file():
             candidates = list(config.DOWNLOADS_DIR.glob(f"{info['id']}.*"))
             if not candidates:
-                raise FileNotFoundError('yt-dlp downloaded the media but no file was found.')
+                raise FileNotFoundError(
+                    'yt-dlp downloaded the media but no file was found.'
+                )
             path = candidates[0]
+
         return str(path)
 
-def video_info(url: str) -> dict:
+
+def audio_dl(url: str) -> str:
     cleaned_url = clean_url(url)
-    opts = _common_opts()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(cleaned_url, download=False)
-    return info
+    last_exc = None
+
+    # Do not merely change the format against one client. A YouTube client
+    # can expose only SABR/image formats, so we move to another client too.
+    attempts = [
+        ('mweb', 'bestaudio/best'),
+        ('mweb', 'best'),
+        ('android_vr', 'bestaudio/best'),
+        ('android_vr', 'best'),
+        ('web_safari', 'bestaudio/best'),
+        ('web_safari', 'best'),
+        ('default', 'bestaudio/best'),
+        ('default', 'best'),
+    ]
+
+    for client, fmt in attempts:
+        try:
+            LOGGER.info(
+                'YouTube download attempt: client=%s format=%s',
+                client, fmt
+            )
+            return _download_with_ytdlp(cleaned_url, client, fmt)
+        except Exception as exc:
+            last_exc = exc
+            LOGGER.warning(
+                'YouTube attempt failed: client=%s format=%s error=%s',
+                client, fmt, str(exc)[:300]
+            )
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError('No YouTube download method was available.')
+
+
+def _extract_info_with_fallback(url: str) -> dict:
+    cleaned_url = clean_url(url)
+    last_exc = None
+
+    for client in YOUTUBE_CLIENTS:
+        try:
+            opts = _common_opts(client)
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(cleaned_url, download=False)
+        except Exception as exc:
+            last_exc = exc
+            LOGGER.warning(
+                'YouTube metadata attempt failed: client=%s error=%s',
+                client, str(exc)[:300]
+            )
+
+    if last_exc:
+        raise last_exc
+    raise RuntimeError('No YouTube metadata method was available.')
+
+
+def video_info(url: str) -> dict:
+    return _extract_info_with_fallback(url)
+
 
 def search_youtube(query: str, max_results: int=4) -> list[dict]:
-    opts = _common_opts()
-    opts['extract_flat'] = True
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(f'ytsearch{max_results}:{query}', download=False)
-    entries = []
-    for entry in (info or {}).get('entries') or []:
-        if entry:
-            entries.append(entry)
-    return entries[:max_results]
+    last_exc = None
+
+    for client in YOUTUBE_CLIENTS:
+        try:
+            opts = _common_opts(client)
+            opts['extract_flat'] = True
+
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                info = ydl.extract_info(
+                    f'ytsearch{max_results}:{query}',
+                    download=False
+                )
+
+            entries = [
+                entry
+                for entry in ((info or {}).get('entries') or [])
+                if entry
+            ]
+
+            if entries:
+                return entries[:max_results]
+
+        except Exception as exc:
+            last_exc = exc
+            LOGGER.warning(
+                'YouTube search attempt failed: client=%s error=%s',
+                client, str(exc)[:300]
+            )
+
+    if last_exc:
+        raise last_exc
+    return []
+
 
 def cleanup_file(path: str | None) -> None:
     if not path:
