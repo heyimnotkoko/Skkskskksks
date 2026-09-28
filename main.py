@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import re
 import shutil
 import signal
@@ -419,6 +420,14 @@ async def stop_assistant() -> None:
 # next one when the current one fails with a format/availability error.
 # Cookies are never used.
 YTDLP_POT_URL = os.getenv("YTDLP_POT_URL", "http://127.0.0.1:4416").strip()
+# Optional: residential proxy, e.g. http://user:pass@host:port
+YTDLP_PROXY = os.getenv("YTDLP_PROXY", "").strip()
+# Optional: several proxies separated by comma or newline; one is picked at random per request.
+YTDLP_PROXIES = [x.strip() for x in re.split(r"[,\n]", os.getenv("YTDLP_PROXIES", "")) if x.strip()]
+if YTDLP_PROXY and YTDLP_PROXY not in YTDLP_PROXIES:
+    YTDLP_PROXIES.append(YTDLP_PROXY)
+# Optional: Netscape cookies.txt exported from a THROWAWAY Google account.
+YTDLP_COOKIES_FILE = os.getenv("YTDLP_COOKIES_FILE", "").strip()
 YOUTUBE_CLIENT_PROFILES: list[list[str]] = [
     ["default"],      # yt-dlp's own recommended clients
     ["android_vr"],   # does not need a PO Token for audio
@@ -431,7 +440,7 @@ AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/ba*/best"
 def ytdlp_base(clients: list[str] | None = None) -> dict[str, Any]:
     """Return a cookie-free yt-dlp profile for Railway."""
     clients = clients or YOUTUBE_CLIENT_PROFILES[0]
-    return {
+    opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
@@ -444,26 +453,43 @@ def ytdlp_base(clients: list[str] | None = None) -> dict[str, Any]:
             "youtubepot-bgutilhttp": {"base_url": YTDLP_POT_URL},
         },
     }
+    if YTDLP_PROXIES:
+        opts["proxy"] = random.choice(YTDLP_PROXIES)
+    if YTDLP_COOKIES_FILE and os.path.isfile(YTDLP_COOKIES_FILE):
+        opts["cookiefile"] = YTDLP_COOKIES_FILE
+    return opts
 
 
 def _retryable_youtube_error(exc: Exception) -> bool:
     low = str(exc).lower()
     return any(
         k in low
-        for k in (
-            "requested format is not available",
-            "no video formats found",
-            "sign in",
-            "not a bot",
-            "403",
-            "forbidden",
-            "po token",
-            "video unavailable",
-        )
+        for k in ("requested format is not available", "no video formats found")
     )
 
 
+def _is_bot_check(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return "not a bot" in low or "sign in" in low or "403" in low
+
+
 def _with_clients(fn):
+    """Try each proxy (if several are configured), and inside it each client profile."""
+    attempts = min(3, len(YTDLP_PROXIES)) if len(YTDLP_PROXIES) > 1 else 1
+    last: Exception | None = None
+    for _ in range(attempts):
+        try:
+            return _with_clients_once(fn)
+        except Exception as exc:  # noqa: BLE001
+            last = exc
+            if not _is_bot_check(exc):
+                raise
+            LOGGER.warning("Bot check hit; retrying with another proxy")
+    assert last is not None
+    raise last
+
+
+def _with_clients_once(fn):
     """Run fn(clients) across the client profiles until one succeeds."""
     last_exc: Exception | None = None
     for clients in YOUTUBE_CLIENT_PROFILES:
@@ -563,7 +589,7 @@ def format_error(exc: Exception) -> str:
     if "403" in low or "forbidden" in low:
         return "يوتيوب رفض تنزيل الملف من خادم Railway (403). تم استخدام مسار PO Token بدون Cookies؛ جرّب المحاولة مرة أخرى."
     if "sign in" in low or "not a bot" in low or "cookies" in low or "po token" in low:
-        return "يوتيوب طلب تحققًا من خادم Railway. تم تفعيل مسار PO Token بدون Cookies؛ إذا استمر الخطأ فالمشكلة من استجابة YouTube لهذا الـIP."
+        return "يوتيوب حظر عنوان IP الخاص بالخادم (Sign in to confirm you're not a bot). الحل: ضبط YTDLP_PROXY (بروكسي سكني) أو YTDLP_COOKIES_FILE على Railway."
     return text[:700]
 
 
