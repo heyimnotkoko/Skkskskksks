@@ -898,32 +898,57 @@ async def play(_, message: Message):
     except Exception:
         pass
     try:
+        # Do not resolve ASS_ID through the bot session. Pyrogram's bot
+        # session may not have the assistant user in its peer cache, which
+        # causes PEER_ID_INVALID. Ask the assistant account about itself.
+        member = None
+        assistant_peer = f"@{ASS_USERNAME}" if ASS_USERNAME else "me"
         try:
-            member = await app.get_chat_member(message.chat.id, ASS_ID)
+            member = await app2.get_chat_member(message.chat.id, "me")
         except ChatAdminRequired:
-            return await fallen.edit_text('‹ : ماعندي صلاحيات حتى اضيف المساعد .')
-        if member.status == ChatMemberStatus.BANNED:
-            key = InlineKeyboardMarkup([[InlineKeyboardButton(text=f'الغاء الحظر عن {ASS_NAME}', callback_data=f'unban_assistant {message.chat.id}|{ASS_ID}')]])
-            return await fallen.edit_text(text=f'‹ : المساعد محظور\n\n‹ : 𝖨𝖣 : `{ASS_ID}`\n‹ : 𝖭𝖠𝖬𝖤 : {ASS_MENTION}\n‹ : 𝖴𝖲𝖤𝖱𝖭𝖠𝖬𝖤 : @{ASS_USERNAME}\n\n‹ : افتح الحظر وحاول مرة ثانية .', reply_markup=key)
-    except UserNotParticipant:
-        if message.chat.username:
-            invitelink = message.chat.username
-        else:
-            try:
-                invitelink = await app.export_chat_invite_link(message.chat.id)
-            except ChatAdminRequired:
-                return await fallen.edit_text('‹ : ماعندي صلاحيات حتى اضيف المساعد .')
-            except Exception as exc:
-                return await fallen.edit_text(f'فشل اضافة {BOT_NAME} المساعد الى {message.chat.title}.\n\nالسبب: `{exc}`')
-        if invitelink.startswith('https://t.me/+'):
-            invitelink = invitelink.replace('https://t.me/+', 'https://t.me/joinchat/')
-        try:
-            await app2.join_chat(invitelink)
-            await asyncio.sleep(1)
-        except UserAlreadyParticipant:
-            pass
+            return await fallen.edit_text('‹ : لا أملك صلاحية كافية للتحقق من أعضاء المجموعة .')
+        except UserNotParticipant:
+            member = None
+        except PeerIdInvalid:
+            member = None
         except Exception as exc:
-            return await fallen.edit_text(f'فشل اضافة {BOT_NAME} المساعد {message.chat.title}.\n\nالسبب: `{exc}`')
+            # For an unknown private chat, we will try joining through an
+            # invite link below instead of failing on the bot's peer cache.
+            LOGGER.info('Assistant peer lookup failed: %s', type(exc).__name__)
+            member = None
+
+        if member is not None and member.status == ChatMemberStatus.BANNED:
+            key = InlineKeyboardMarkup([[InlineKeyboardButton(text=f'الغاء الحظر عن {ASS_NAME}', callback_data=f'unban_assistant {message.chat.id}|{ASS_USERNAME or ASS_ID}')]])
+            return await fallen.edit_text(text=f'‹ : المساعد محظور\n\n‹ : 𝖨𝖣 : `{ASS_ID}`\n‹ : 𝖭𝖠𝖬𝖤 : {ASS_MENTION}\n‹ : 𝖴𝖲𝖤𝖱𝖭𝖠𝖬𝖤 : @{ASS_USERNAME or "-"}\n\n‹ : افتح الحظر وحاول مرة ثانية .', reply_markup=key)
+
+        if member is None:
+            if message.chat.username:
+                invitelink = f'https://t.me/{message.chat.username}'
+            else:
+                try:
+                    invitelink = await app.export_chat_invite_link(message.chat.id)
+                except ChatAdminRequired:
+                    return await fallen.edit_text('‹ : ماعندي صلاحيات حتى أنشئ رابط دعوة للمساعد .')
+                except Exception as exc:
+                    return await fallen.edit_text(f'فشل الحصول على رابط دعوة لـ {BOT_NAME} المساعد في {message.chat.title}.\n\nالسبب: `{exc}`')
+            if invitelink.startswith('https://t.me/+'):
+                invitelink = invitelink.replace('https://t.me/+', 'https://t.me/joinchat/')
+            try:
+                await app2.join_chat(invitelink)
+                await asyncio.sleep(0.8)
+            except UserAlreadyParticipant:
+                pass
+            except Exception as exc:
+                return await fallen.edit_text(f'فشل اضافة {BOT_NAME} المساعد إلى {message.chat.title}.\n\nالسبب: `{exc}`')
+            try:
+                member = await app2.get_chat_member(message.chat.id, "me")
+            except UserNotParticipant:
+                return await fallen.edit_text(f'‹ : تعذر التأكد من دخول المساعد إلى {message.chat.title}.')
+            except Exception as exc:
+                return await fallen.edit_text(f'‹ : تعذر التحقق من المساعد.\n\nالسبب: `{exc}`')
+    except Exception as exc:
+        LOGGER.error('Assistant membership check failed: %s', exc)
+        return await fallen.edit_text(f'‹ : تعذر التحقق من حساب المساعد.\n\nالسبب: `{exc}`')
     ruser = message.from_user.first_name
     audio = message.reply_to_message.audio or message.reply_to_message.voice if message.reply_to_message else None
     url = get_url(message)
@@ -964,7 +989,7 @@ async def play(_, message: Message):
             file_path = await asyncio.to_thread(audio_dl, target_url)
         except Exception as exc:
             LOGGER.error('YouTube download failed: %s', exc)
-            return await fallen.edit_text(f'‹ : فشل تحميل المقطع من يوتيوب .\n\nالخطأ: `{exc}`')
+            return await fallen.edit_text(f'‹ : فشل تحميل المقطع من يوتيوب .\n\nالخطأ: `{_youtube_error_message(exc)}`')
     try:
         if await is_active_chat(message.chat.id):
             await put(message.chat.id, title, duration, videoid, file_path, ruser, message.from_user.id)
@@ -1117,7 +1142,7 @@ async def song(_, message: Message):
         duration = f'{duration_seconds // 60}:{duration_seconds % 60:02d}'
     except Exception as exc:
         LOGGER.error('YouTube search failed: %s', exc)
-        return await m.edit_text(f'‹ : فشل جلب المقطع من اليوتيوب\n\nالنتيجة: `{exc}`')
+        return await m.edit_text(f'‹ : فشل جلب المقطع من اليوتيوب\n\nالنتيجة: `{_youtube_error_message(exc)}`')
     await m.edit_text('‹ : تحميل الاغنية,\n\n‹ : انتظر ...')
     audio_file = None
     try:
@@ -1166,7 +1191,7 @@ async def fallen_st(_, message: Message):
                     return await app.send_photo(message.chat.id, photo=thumbnail, caption=text, reply_markup=InlineKeyboardMarkup(pm_buttons))
                 return await app.send_message(message.chat.id, text=text, reply_markup=InlineKeyboardMarkup(pm_buttons), disable_web_page_preview=True)
             except Exception as exc:
-                return await m.edit_text(f'فشل جلب المعلومات.\n\n`{exc}`')
+                return await m.edit_text(f'فشل جلب المعلومات.\n\n`{_youtube_error_message(exc)}`')
     if message.chat.type == ChatType.PRIVATE:
         caption = PM_START_TEXT.format(message.from_user.first_name, BOT_MENTION)
         if config.START_IMG:
