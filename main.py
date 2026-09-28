@@ -413,21 +413,24 @@ async def stop_assistant() -> None:
     ASS_MENTION = ""
 
 
-# YouTube extraction is intentionally kept on one modern client instead of
-# cycling through many clients. Current yt-dlp guidance recommends mweb + a
-# PO Token Provider for GVS requests. This implementation never reads cookies.
-YOUTUBE_CLIENT = "mweb"
+# YouTube extraction: the "mweb" client alone often returns NO audio formats
+# (SABR / PO Token restrictions), which produces "Requested format is not
+# available". We now try a short, ordered list of clients and only move to the
+# next one when the current one fails with a format/availability error.
+# Cookies are never used.
 YTDLP_POT_URL = os.getenv("YTDLP_POT_URL", "http://127.0.0.1:4416").strip()
+YOUTUBE_CLIENT_PROFILES: list[list[str]] = [
+    ["default"],      # yt-dlp's own recommended clients
+    ["android_vr"],   # does not need a PO Token for audio
+    ["tv"],
+    ["mweb"],         # last resort (needs the bgutil POT provider)
+]
+AUDIO_FORMAT = "bestaudio[ext=m4a]/bestaudio/ba*/best"
 
 
-def ytdlp_base() -> dict[str, Any]:
-    """Return a single, cookie-free yt-dlp profile for Railway.
-
-    The Railway image starts the bgutil POT provider locally. If the provider
-    is not available, yt-dlp can still attempt extraction, but we do not fall
-    back to a burst of different clients which tends to trigger more bot
-    checks from YouTube.
-    """
+def ytdlp_base(clients: list[str] | None = None) -> dict[str, Any]:
+    """Return a cookie-free yt-dlp profile for Railway."""
+    clients = clients or YOUTUBE_CLIENT_PROFILES[0]
     return {
         "quiet": True,
         "no_warnings": True,
@@ -437,16 +440,52 @@ def ytdlp_base() -> dict[str, Any]:
         "socket_timeout": 20,
         "js_runtimes": {"node": {}},
         "extractor_args": {
-            "youtube": {"player_client": [YOUTUBE_CLIENT]},
+            "youtube": {"player_client": clients},
             "youtubepot-bgutilhttp": {"base_url": YTDLP_POT_URL},
         },
     }
 
 
+def _retryable_youtube_error(exc: Exception) -> bool:
+    low = str(exc).lower()
+    return any(
+        k in low
+        for k in (
+            "requested format is not available",
+            "no video formats found",
+            "sign in",
+            "not a bot",
+            "403",
+            "forbidden",
+            "po token",
+            "video unavailable",
+        )
+    )
+
+
+def _with_clients(fn):
+    """Run fn(clients) across the client profiles until one succeeds."""
+    last_exc: Exception | None = None
+    for clients in YOUTUBE_CLIENT_PROFILES:
+        try:
+            return fn(clients)
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            LOGGER.warning("yt-dlp failed with clients=%s: %s", clients, str(exc)[:200])
+            if not _retryable_youtube_error(exc):
+                raise
+    assert last_exc is not None
+    raise last_exc
+
+
 def youtube_info(url: str) -> dict[str, Any]:
-    opts = ytdlp_base()
-    with yt_dlp.YoutubeDL(opts) as ydl:
-        return ydl.extract_info(url, download=False)
+    def run(clients: list[str]) -> dict[str, Any]:
+        opts = ytdlp_base(clients)
+        opts["format"] = AUDIO_FORMAT
+        with yt_dlp.YoutubeDL(opts) as ydl:
+            return ydl.extract_info(url, download=False)
+
+    return _with_clients(run)
 
 
 def youtube_search(query: str, limit: int = 4) -> list[dict[str, Any]]:
@@ -460,25 +499,24 @@ def youtube_search(query: str, limit: int = 4) -> list[dict[str, Any]]:
     return entries[:limit]
 
 
-def choose_audio_format() -> str:
-    # Prefer the audio-only stream and fall back to the best available format.
-    return "bestaudio/best"
-
-
 def download_audio(url: str) -> str:
     unique = uuid.uuid4().hex
-    opts = ytdlp_base()
-    opts.update(
-        {
-            "format": choose_audio_format(),
-            "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
-            "overwrites": True,
-        }
-    )
-    try:
+
+    def run(clients: list[str]) -> None:
+        opts = ytdlp_base(clients)
+        opts.update(
+            {
+                "format": AUDIO_FORMAT,
+                "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
+                "overwrites": True,
+            }
+        )
         with yt_dlp.YoutubeDL(opts) as ydl:
             ydl.extract_info(url, download=True)
-        files = list(DOWNLOADS_DIR.glob(f"{unique}.*"))
+
+    try:
+        _with_clients(run)
+        files = [f for f in DOWNLOADS_DIR.glob(f"{unique}.*") if not f.name.endswith(".part")]
         if not files:
             raise FileNotFoundError("Downloaded file was not found")
         path = files[0]
