@@ -409,7 +409,16 @@ def _youtube_error_message(exc: Exception) -> str:
 
 def _audio_opts() -> dict:
     opts = _common_opts()
-    opts.update({'format': 'bestaudio[ext=m4a]/bestaudio', 'outtmpl': str(config.DOWNLOADS_DIR / '%(id)s.%(ext)s'), 'overwrites': True})
+    opts.update({
+        # Do not force m4a: some YouTube client responses expose audio only
+        # as webm/opus or expose a combined audio+video format.
+        # `bestaudio/best` keeps an audio-only preference while falling back
+        # to any playable format instead of raising "Requested format is not available".
+        'format': 'bestaudio/best',
+        'outtmpl': str(config.DOWNLOADS_DIR / '%(id)s.%(ext)s'),
+        'overwrites': True,
+        'format_sort': ['abr', 'res', 'fps'],
+    })
     return opts
 
 def audio_dl(url: str) -> str:
