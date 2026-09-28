@@ -1,0 +1,5 @@
+kurigram==2.2.1
+py-tgcalls==0.9.7
+python-dotenv==1.0.1
+tgcrypto==1.2.5
+yt-dlp==2026.8.19
