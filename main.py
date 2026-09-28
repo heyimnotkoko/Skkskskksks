@@ -413,26 +413,22 @@ async def stop_assistant() -> None:
     ASS_MENTION = ""
 
 
-# YouTube extraction is deliberately cookie-free.
-# Android is preferred because it can provide direct CDN formats without
-# browser cookies. Each client is tried separately to avoid mixed-client URLs.
-YOUTUBE_CLIENTS = ("android", "tv", "web_embedded", "android_vr")
+YOUTUBE_CLIENTS = ("web_safari", "android_vr", "web_embedded", "tv", "default")
 
 
 def ytdlp_base(client: str) -> dict[str, Any]:
-    return {
+    opts: dict[str, Any] = {
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
         "retries": 2,
-        "fragment_retries": 2,
         "socket_timeout": 20,
-        "extractor_args": {
-            "youtube": {
-                "player_client": [client],
-            }
-        },
+        "extractor_args": {"youtube": {"player_client": [client]}},
     }
+    cookiefile = Path(os.getenv("YTDLP_COOKIES_FILE", "cookies.txt"))
+    if cookiefile.is_file():
+        opts["cookiefile"] = str(cookiefile)
+    return opts
 
 
 def youtube_info(url: str) -> dict[str, Any]:
@@ -440,15 +436,11 @@ def youtube_info(url: str) -> dict[str, Any]:
     for client in YOUTUBE_CLIENTS:
         try:
             opts = ytdlp_base(client)
-            opts["skip_download"] = True
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
         except Exception as exc:
             last = exc
-            LOGGER.warning(
-                "YouTube metadata failed client=%s error=%s",
-                client, str(exc)[:250]
-            )
+            LOGGER.warning("YouTube metadata failed client=%s error=%s", client, str(exc)[:250])
     raise last or RuntimeError("YouTube metadata unavailable")
 
 
@@ -465,24 +457,20 @@ def youtube_search(query: str, limit: int = 4) -> list[dict[str, Any]]:
                 return entries[:limit]
         except Exception as exc:
             last = exc
-            LOGGER.warning(
-                "YouTube search failed client=%s error=%s",
-                client, str(exc)[:250]
-            )
+            LOGGER.warning("YouTube search failed client=%s error=%s", client, str(exc)[:250])
     raise last or RuntimeError("YouTube search unavailable")
 
 
 def choose_audio_format() -> str:
-    return "bestaudio/best"
+    # A moderate bitrate is enough for voice-chat music and avoids unnecessarily
+    # large temporary files. yt-dlp will fall back if the exact filter is absent.
+    return "bestaudio[abr<=160]/bestaudio/best"
 
 
 def download_audio(url: str) -> str:
     last: Exception | None = None
     unique = uuid.uuid4().hex
-
-    # Keep Android first. No cookies or browser session is used.
-    attempts = ("android", "tv", "web_embedded", "android_vr")
-
+    attempts = ("web_safari", "android_vr", "web_embedded", "tv", "default")
     for client in attempts:
         try:
             opts = ytdlp_base(client)
@@ -491,67 +479,24 @@ def download_audio(url: str) -> str:
                     "format": choose_audio_format(),
                     "outtmpl": str(DOWNLOADS_DIR / f"{unique}.%(ext)s"),
                     "overwrites": True,
-                    "continuedl": False,
-                    "nopart": True,
                 }
             )
-
             with yt_dlp.YoutubeDL(opts) as ydl:
                 ydl.extract_info(url, download=True)
-
-            files = [
-                f for f in DOWNLOADS_DIR.glob(f"{unique}.*")
-                if f.is_file() and f.stat().st_size > 0
-            ]
+            files = list(DOWNLOADS_DIR.glob(f"{unique}.*"))
             if not files:
                 raise FileNotFoundError("Downloaded file was not found")
-
-            path = max(files, key=lambda f: f.stat().st_size)
+            path = files[0]
             if path.stat().st_size > MAX_AUDIO_MB * 1024 * 1024:
                 cleanup_file(path)
-                raise RuntimeError(
-                    f"الملف أكبر من الحد المسموح ({MAX_AUDIO_MB} MB)."
-                )
+                raise RuntimeError(f"الملف أكبر من الحد المسموح ({MAX_AUDIO_MB} MB).")
             return str(path)
-
         except Exception as exc:
             last = exc
-            for f in DOWNLOADS_DIR.glob(f"{unique}.*"):
-                cleanup_file(f)
-            LOGGER.warning(
-                "YouTube download failed client=%s error=%s",
-                client, str(exc)[:300]
-            )
-
+            for p in DOWNLOADS_DIR.glob(f"{unique}.*"):
+                cleanup_file(p)
+            LOGGER.warning("YouTube download failed client=%s error=%s", client, str(exc)[:300])
     raise last or RuntimeError("Audio download failed")
-
-
-def format_error(exc: Exception) -> str:
-    text = str(exc)
-    low = text.lower()
-
-    if "requested format is not available" in low:
-        return "يوتيوب لم يعرض صيغة صوت قابلة للتنزيل لهذا المقطع."
-
-    if "403" in low or "forbidden" in low:
-        return (
-            "يوتيوب رفض رابط التنزيل من خادم Railway. "
-            "تمت محاولة عدة اتصالات بدون Cookies؛ جرّب مقطعًا آخر إذا استمر الرفض."
-        )
-
-    if "sign in to confirm" in low or "not a bot" in low:
-        return (
-            "يوتيوب فعّل تحققًا على عنوان خادم Railway لهذا الطلب. "
-            "البوت يعمل بدون Cookies، لكن يوتيوب قد يرفض بعض الطلبات من الخادم."
-        )
-
-    if "po token" in low:
-        return (
-            "يوتيوب طلب PO Token لهذا الاتصال. "
-            "تمت محاولة عميل لا يعتمد عليه أولًا، بدون Cookies."
-        )
-
-    return text[:700]
 
 
 async def resolve_query(query: str) -> tuple[str, str, str, int]:
@@ -681,11 +626,73 @@ async def start_next(chat_id: int) -> bool:
 
                 try:
                     if had_stream:
-                        await pytgcalls.change_stream(chat_id, stream)
+                        # Telegram can briefly lose the participant state after a
+                        # 503/timeout from phone.JoinGroupCall. In that state
+                        # change_stream raises PARTICIPANT_JOIN_MISSING. Rejoin
+                        # the call instead of treating the track as permanently
+                        # broken.
+                        changed = False
+                        last_exc = None
+                        for attempt in range(3):
+                            try:
+                                await pytgcalls.change_stream(chat_id, stream)
+                                changed = True
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                msg = str(exc)
+                                participant_missing = "PARTICIPANT_JOIN_MISSING" in msg
+                                if not participant_missing or attempt >= 2:
+                                    raise
+                                LOGGER.warning(
+                                    "Telegram lost the voice-chat participant state; "
+                                    "rejoining before changing stream (attempt %s/3)",
+                                    attempt + 1,
+                                )
+                                try:
+                                    await pytgcalls.leave_group_call(chat_id)
+                                except Exception:
+                                    pass
+                                await asyncio.sleep(1.5)
+                                await pytgcalls.join_group_call(
+                                    chat_id,
+                                    stream,
+                                    stream_type=StreamType().pulse_stream,
+                                )
+                                await asyncio.sleep(0.8)
+
+                        if not changed and last_exc is not None:
+                            raise last_exc
                     else:
-                        await pytgcalls.join_group_call(
-                            chat_id, stream, stream_type=StreamType().pulse_stream
-                        )
+                        # A transient Telegram 503 may be returned while the
+                        # server is still completing the join. Retry the join
+                        # without downloading the media again.
+                        last_exc = None
+                        joined = False
+                        for attempt in range(3):
+                            try:
+                                await pytgcalls.join_group_call(
+                                    chat_id,
+                                    stream,
+                                    stream_type=StreamType().pulse_stream,
+                                )
+                                joined = True
+                                # Give Telegram a short moment to commit the
+                                # participant state before the next transition.
+                                await asyncio.sleep(0.8)
+                                break
+                            except Exception as exc:
+                                last_exc = exc
+                                LOGGER.warning(
+                                    "Voice-chat join failed (attempt %s/3): %s",
+                                    attempt + 1,
+                                    type(exc).__name__,
+                                )
+                                if attempt < 2:
+                                    await asyncio.sleep(1.2 * (attempt + 1))
+                        if not joined:
+                            raise last_exc
+
                 except (NoActiveGroupCall, TelegramServerError, UnMuteNeeded) as exc:
                     queue_finish(row_id)
                     cleanup_file(file_path)
