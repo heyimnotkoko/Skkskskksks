@@ -556,7 +556,7 @@ async def report_cannot_send(chat_id: int, exc: Exception) -> None:
     title = await chat_title(chat_id)
     await notify_owner(
         f"cant_send:{chat_id}",
-        "🔇 تنبيه للمالك\n\n"
+        "تنبيه للمالك\n\n"
         f"لا يستطيع البوت إرسال رسائل في: {title}\n({chat_id})\n"
         f"السبب: {type(exc).__name__}\n\n"
         "الحل: من إعدادات المشرفين في تلك المحادثة فعّل للبوت صلاحية إرسال الرسائل "
@@ -698,9 +698,75 @@ async def any_assistant_admin(chat_id: int) -> bool:
     return bool(await admin_assistants(chat_id, ready_assistants()))
 
 
-async def pick_assistant(chat_id: int) -> tuple[Assistant | None, str]:
-    """Choose the assistant that serves a chat: sticky while a call is active,
-    otherwise the least busy assistant that is an admin of the chat."""
+# ---------------------------------------------------------------------------
+# Assistants do NOT have to be admins. In a normal group an assistant that is a plain
+# member can stream as long as the voice chat lets members speak. In channels only
+# admins can stream. If the assistant is not in the group yet, it joins automatically
+# (public username, or an invite link created by the bot when it may invite users).
+# ---------------------------------------------------------------------------
+_MEMBER_STATUS = getattr(ChatMemberStatus, "MEMBER", "member")
+CHANNEL_CHATS: dict[int, bool] = {}
+
+
+async def is_channel_chat(chat_id: int, chat_type: Any = None) -> bool:
+    if chat_type is not None:
+        CHANNEL_CHATS[chat_id] = chat_type == ChatType.CHANNEL
+    if chat_id in CHANNEL_CHATS:
+        return CHANNEL_CHATS[chat_id]
+    try:
+        chat = await app.get_chat(chat_id)
+        CHANNEL_CHATS[chat_id] = chat.type == ChatType.CHANNEL
+    except Exception:  # noqa: BLE001
+        return False
+    return CHANNEL_CHATS[chat_id]
+
+
+async def try_join(a: Assistant, chat_id: int) -> bool:
+    try:
+        chat = await app.get_chat(chat_id)
+        target = chat.username or await app.export_chat_invite_link(chat_id)
+        await a.client.join_chat(target)
+        LOGGER.info("Assistant %s joined chat %s", a.plain(), chat_id)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Assistant %s could not join %s: %s", a.plain(), chat_id, type(exc).__name__)
+        return False
+
+
+async def assistant_standing(a: Assistant, chat_id: int) -> str:
+    """'admin' | 'member' | '' (not in the chat / banned / restricted)."""
+    if not a.ready:
+        return ""
+    try:
+        member = await a.client.get_chat_member(chat_id, "me")
+    except UserNotParticipant:
+        return ""
+    except RPCError as exc:
+        LOGGER.warning("Assistant standing check failed: %s", type(exc).__name__)
+        return ""
+    if member.status in {ChatMemberStatus.ADMINISTRATOR, ChatMemberStatus.OWNER}:
+        return "admin"
+    if member.status == _MEMBER_STATUS:
+        return "member"
+    return ""
+
+
+async def usable_assistants(chat_id: int, candidates: list[Assistant], channel: bool) -> list[Assistant]:
+    """Admins first, then (groups only) plain members; both ordered by current load."""
+    if not candidates:
+        return []
+    standings = await asyncio.gather(*(assistant_standing(a, chat_id) for a in candidates))
+    key = lambda x: (assistant_load(x), ASSISTANTS.index(x))  # noqa: E731
+    admins = sorted((a for a, s in zip(candidates, standings) if s == "admin"), key=key)
+    if channel:
+        return admins
+    members = sorted((a for a, s in zip(candidates, standings) if s == "member"), key=key)
+    return admins + members
+
+
+async def pick_assistant(chat_id: int, chat_type: Any = None) -> tuple[Assistant | None, str]:
+    """Choose the assistant that serves a chat: sticky while a call is active, otherwise
+    the least busy usable assistant (admin preferred, member accepted in groups)."""
     ready = ready_assistants()
     if not ready:
         return None, "حساب المساعد غير متصل."
@@ -711,24 +777,31 @@ async def pick_assistant(chat_id: int) -> tuple[Assistant | None, str]:
         cur = None
     if cur is not None and (chat_id in IN_CALL or chat_lock(chat_id).locked()):
         return cur, ""
-    admins = await admin_assistants(chat_id, ready)
-    if not admins:
+    channel = await is_channel_chat(chat_id, chat_type)
+    usable = await usable_assistants(chat_id, ready, channel)
+    if not usable and not channel:
+        # Nobody is in the group yet: let the least busy assistant join by itself.
+        for a in sorted(ready, key=lambda x: (assistant_load(x), ASSISTANTS.index(x))):
+            if await try_join(a, chat_id) and await assistant_standing(a, chat_id):
+                usable = [a]
+                break
+    if not usable:
         names = "، ".join(a.display() for a in ready[:3])
-        if len(ready) == 1:
-            return None, f"أضف حساب المساعد {names} كمشرف ثم أعد المحاولة."
-        return None, f"أضف أحد حسابات المساعد ({names}) كمشرف ثم أعد المحاولة."
-    chosen = min(admins, key=lambda x: (assistant_load(x), ASSISTANTS.index(x)))
-    CHAT_ASSISTANT[chat_id] = chosen
-    return chosen, ""
+        if channel:
+            return None, f"في القنوات يجب أن يكون المساعد {names} مشرفًا (صلاحية إدارة البث المباشر)."
+        return None, (
+            f"تعذر دخول المساعد {names} إلى المجموعة تلقائيًا. أضفه يدويًا أو أعطِ البوت صلاحية "
+            "دعوة المستخدمين، ثم أعد المحاولة."
+        )
+    CHAT_ASSISTANT[chat_id] = usable[0]
+    return usable[0], ""
 
 
 async def next_assistant(chat_id: int, tried: list[Assistant]) -> Assistant | None:
-    """Another ready assistant (admin in the chat) that was not tried yet."""
+    """Another usable assistant that was not tried yet."""
     others = [a for a in ready_assistants() if a not in tried]
-    admins = await admin_assistants(chat_id, others)
-    if not admins:
-        return None
-    return min(admins, key=lambda x: (assistant_load(x), ASSISTANTS.index(x)))
+    usable = await usable_assistants(chat_id, others, await is_channel_chat(chat_id))
+    return usable[0] if usable else None
 
 
 async def chat_title(chat_id: int) -> str:
@@ -748,7 +821,7 @@ async def alert_unauthorized(chat_id: int) -> None:
     title = await chat_title(chat_id)
     await notify_owner(
         f"unauth:{chat_id}",
-        f"🔒 محاولة تشغيل من محادثة غير مسموحة\n\n{title}\n{chat_id}\n\n"
+        f"محاولة تشغيل من محادثة غير مسموحة\n\n{title}\n{chat_id}\n\n"
         "للسماح: أرسل /allow داخل المحادثة، أو افتح /panel ثم المحادثات.",
         86400,
     )
@@ -834,7 +907,7 @@ def note_youtube_block(exc: Exception, where: str) -> None:
     _YT_BLOCK_REPORTED = True
     notify_owner_threadsafe(
         "yt_block",
-        "🚫 تنبيه للمالك\n\n"
+        "تنبيه للمالك\n\n"
         "يوتيوب حظر عنوان IP الخاص بالخادم (طلب تسجيل الدخول / Bot check).\n"
         f"البوت يستخدم SoundCloud تلقائيًا لمدة {max(1, YT_BLOCK_COOLDOWN // 60)} دقيقة ثم يجرّب يوتيوب مجددًا. "
         "لا يظهر أي شيء عن ذلك في المجموعات أو القنوات.\n\n"
@@ -851,7 +924,7 @@ def note_youtube_ok() -> None:
     if _YT_BLOCK_REPORTED:
         _YT_BLOCK_REPORTED = False
         OWNER_ALERTS.pop("yt_block", None)  # so a future block alerts immediately again
-        notify_owner_threadsafe("yt_ok", "✅ عاد يوتيوب للعمل، سيستخدمه البوت كمصدر أول من جديد.", 0)
+        notify_owner_threadsafe("yt_ok", "عاد يوتيوب للعمل، سيستخدمه البوت كمصدر أول من جديد.", 0)
 
 
 # ---------------------------------------------------------------------------
@@ -962,7 +1035,7 @@ async def start_all_assistants() -> None:
         if not await start_assistant(a):
             await notify_owner(
                 f"assistant_start:{a.key}",
-                f"⚠️ تنبيه للمالك\n\nتعذر تشغيل حساب المساعد ({a.plain()}). السبب: {a.error or 'غير معروف'}.",
+                f"تنبيه للمالك\n\nتعذر تشغيل حساب المساعد ({a.plain()}). السبب: {a.error or 'غير معروف'}.",
             )
     LOGGER.info("Assistants ready: %s/%s", len(ready_assistants()), len(ASSISTANTS))
 
@@ -1160,6 +1233,7 @@ _FLAG_DEFAULTS: dict[str, bool] = {
     "auto_delete": AUTO_DELETE_COMMANDS,
     "owner_alerts": True,
     "allowlist": False,
+    "video_overlay": True,
 }
 _FLAG_CACHE: dict[str, bool] = {}
 
@@ -1483,7 +1557,7 @@ async def public_error(exc: Exception, where: str = "", fallback: str | None = N
     spawn(
         notify_owner(
             key,
-            f"⚠️ تنبيه للمالك\n\nفشل طلب من أحد المستخدمين. {detail}\n"
+            f"تنبيه للمالك\n\nفشل طلب من أحد المستخدمين. {detail}\n"
             f"المكان: {where or '-'}\nالخطأ: {raw[:500]}",
         )
     )
@@ -1499,18 +1573,18 @@ def control_keyboard(chat_id: int | None = None) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
             [
-                _btn("▶️ استكمال" if paused else "⏸ إيقاف مؤقت", "toggle_cb"),
-                _btn("⏭ تخطي", "skip_cb"),
+                _btn("استكمال" if paused else "إيقاف مؤقت", "toggle_cb"),
+                _btn("تخطي", "skip_cb"),
             ],
-            [_btn("📋 القائمة", "queue_cb"), _btn("⏹ إنهاء", "end_cb")],
+            [_btn("القائمة", "queue_cb"), _btn("إنهاء", "end_cb")],
         ]
     )
 
 
 def support_keyboard() -> InlineKeyboardMarkup:
-    rows = [[InlineKeyboardButton("✖️ إغلاق", callback_data="close")]]
+    rows = [[InlineKeyboardButton("إغلاق", callback_data="close")]]
     if DEVELOPER_CHANNEL:
-        rows.insert(0, [InlineKeyboardButton("📢 قناة المطور", url=f"https://t.me/{DEVELOPER_CHANNEL}")])
+        rows.insert(0, [InlineKeyboardButton("قناة المطور", url=f"https://t.me/{DEVELOPER_CHANNEL}")])
     return InlineKeyboardMarkup(rows)
 
 
@@ -1518,7 +1592,7 @@ def now_playing_text(row: sqlite3.Row) -> str:
     source = "SoundCloud" if is_soundcloud_url(row["url"]) else "YouTube"
     waiting = queue_count(row["chat_id"])
     lines = [
-        "🎵 KroMusic",
+        "KroMusic",
         "",
         f"العنوان: {row['title'] or 'بدون عنوان'}",
         f"المدة: `{readable_time(row['duration'])}`",
@@ -1652,17 +1726,256 @@ async def make_loop_video(source: str, is_image: bool) -> None:
             pass
 
 
-async def build_video_media(audio_path: str, duration: int) -> str | None:
+# ---------------------------------------------------------------------------
+# Video overlay: song title at the bottom, a progress bar that really moves, the
+# elapsed / total time, and a credit line under the bar. It is rendered into the
+# track's video once (ffmpeg), so pause / resume stay perfectly in sync.
+# Needs:  Pillow   (and arabic-reshaper + python-bidi for correct Arabic titles)
+# ---------------------------------------------------------------------------
+VIDEO_CREDIT = os.getenv("VIDEO_CREDIT", "KroTheCommander").strip()
+VIDEO_OVERLAY_MAX_MINUTES = int(os.getenv("VIDEO_OVERLAY_MAX_MINUTES", "12"))
+VIDEO_RENDER_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("VIDEO_RENDER_CONCURRENCY", "2"))))
+FONT_DIR = BASE_DIR / "fonts"
+FONT_DIR.mkdir(parents=True, exist_ok=True)
+_FONT_URLS = (
+    "https://github.com/google/fonts/raw/main/ofl/tajawal/Tajawal-Bold.ttf",
+    "https://raw.githubusercontent.com/google/fonts/main/ofl/tajawal/Tajawal-Bold.ttf",
+)
+_SYSTEM_FONTS = (
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+    "/usr/share/fonts/truetype/noto/NotoNaskhArabic-Bold.ttf",
+    "/usr/share/fonts/truetype/freefont/FreeSansBold.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+)
+try:
+    import arabic_reshaper as _ar
+    from bidi.algorithm import get_display as _bidi_display
+except Exception:  # noqa: BLE001
+    _ar = None
+    _bidi_display = None
+_ARABIC_RE = re.compile("[\u0600-\u06FF\u0750-\u077F\uFB50-\uFDFF\uFE70-\uFEFF]")
+_SYMBOL_RE = re.compile(
+    "[\U0001F000-\U0001FAFF\u2190-\u21FF\u2300-\u23FF\u2460-\u24FF\u25A0-\u27BF\u2900-\u297F"
+    "\u2B00-\u2BFF\uFE0E\uFE0F\u200D\u20E3\u2600-\u26FF]+"
+)
+_CLOCK_TEXT = r"%{eif\:trunc(t/60)\:d\:2}\:%{eif\:mod(trunc(t)\,60)\:d\:2}"
+
+
+def pick_font() -> str | None:
+    env = os.getenv("VIDEO_FONT", "").strip()
+    if env and os.path.isfile(env):
+        return env
+    found = [str(p) for p in sorted(FONT_DIR.iterdir()) if p.suffix.lower() in {".ttf", ".otf"}]
+    found += [p for p in _SYSTEM_FONTS if os.path.isfile(p)]
+    if not found:
+        return None
+    bold = [p for p in found if "bold" in os.path.basename(p).lower()]
+    return (bold or found)[0]
+
+
+def ensure_fonts() -> None:
+    """Download an Arabic-capable font once when none was provided (runs in a thread)."""
+    import urllib.request
+    from PIL import ImageFont
+
+    if os.getenv("VIDEO_FONT", "").strip() or any(p.suffix.lower() in {".ttf", ".otf"} for p in FONT_DIR.iterdir()):
+        return
+    target = FONT_DIR / "Tajawal-Bold.ttf"
+    for url in _FONT_URLS:
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=25) as r:  # noqa: S310
+                data = r.read(6_000_000)
+            target.write_bytes(data)
+            ImageFont.truetype(str(target), 20)  # validates the file
+            LOGGER.info("Overlay font downloaded: %s", target.name)
+            return
+        except Exception as exc:  # noqa: BLE001
+            target.unlink(missing_ok=True)
+            LOGGER.warning("Font download failed: %s", type(exc).__name__)
+    LOGGER.warning("No overlay font downloaded; using %s", pick_font() or "the built-in font")
+
+
+def shape_text(text: str) -> str:
+    if _ar is not None and _bidi_display is not None and _ARABIC_RE.search(text):
+        try:
+            return _bidi_display(_ar.reshape(text))
+        except Exception:  # noqa: BLE001
+            return text
+    return text
+
+
+def overlay_title(title: str) -> str:
+    t = _SYMBOL_RE.sub(" ", title or "")
+    t = re.sub(r"[\x00-\x1f]", " ", t)
+    return re.sub(r"\s+", " ", t).strip() or BOT_NAME
+
+
+def _fmt_clock(seconds: float) -> str:
+    s = max(0, int(seconds))
+    return f"{s // 3600}:{s % 3600 // 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60:02d}:{s % 60:02d}"
+
+
+def overlay_geometry(w: int, h: int) -> dict[str, int]:
+    even = lambda v: int(v) // 2 * 2  # noqa: E731
+    bx = even(w * 0.08)
+    return {
+        "bx": bx,
+        "bw": even(w - 2 * bx),
+        "by": even(h * 0.815),
+        "bh": max(4, even(h * 0.018)),
+        "ts": max(10, int(h * 0.042)),
+    }
+
+
+def render_overlay_png(path: Path, w: int, h: int, title: str, total_seconds: float) -> None:
+    from PIL import Image, ImageDraw, ImageFont
+
+    font_path = pick_font()
+    use_basic = _ar is not None and _bidi_display is not None
+
+    def font(size: int):
+        if not font_path:
+            return ImageFont.load_default(size)
+        if use_basic:
+            return ImageFont.truetype(font_path, size, layout_engine=ImageFont.Layout.BASIC)
+        return ImageFont.truetype(font_path, size)
+
+    g = overlay_geometry(w, h)
+    img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    top = int(h * 0.58)
+    span = max(1, h - top)
+    for y in range(top, h):  # soft dark gradient so the text is readable on any clip
+        a = int(215 * (((y - top) / span) ** 1.25))
+        d.line([(0, y), (w, y)], fill=(0, 0, 0, a))
+
+    # title: shrink to fit, then cut with "..." if it is still too long
+    clean = overlay_title(title)
+    max_w = int(w * 0.86)
+    size = int(h * 0.072)
+    min_size = max(12, int(h * 0.046))
+    while size > min_size and d.textlength(shape_text(clean), font=font(size)) > max_w:
+        size -= 2
+    f_title = font(size)
+    shown = clean
+    while len(shown) > 3 and d.textlength(shape_text(shown), font=f_title) > max_w:
+        shown = shown[:-1].rstrip()
+        if d.textlength(shape_text(shown + "..."), font=f_title) <= max_w:
+            shown += "..."
+            break
+    cy = int(h * 0.735)
+    txt = shape_text(shown)
+    d.text((w // 2 + 2, cy + 2), txt, font=f_title, fill=(0, 0, 0, 200), anchor="mm")
+    d.text((w // 2, cy), txt, font=f_title, fill=(255, 255, 255, 255), anchor="mm")
+
+    # total time under the right end of the bar (the elapsed time is drawn live by ffmpeg)
+    ty = g["by"] + g["bh"] + int(h * 0.012)
+    d.text((g["bx"] + g["bw"], ty - max(1, int(h * 0.009))), _fmt_clock(total_seconds), font=font(g["ts"]), fill=(235, 235, 235, 255), anchor="ra")
+
+    # credit line under the bar
+    if VIDEO_CREDIT:
+        cs = max(10, int(h * 0.043))
+        f_credit = font(cs)
+        track = cs * 0.14
+        widths = [d.textlength(ch, font=f_credit) for ch in VIDEO_CREDIT]
+        total_w = sum(widths) + track * (len(VIDEO_CREDIT) - 1)
+        x = (w - total_w) / 2
+        cyc = int(h * 0.935)
+        for ch, cw in zip(VIDEO_CREDIT, widths):
+            d.text((x, cyc), ch, font=f_credit, fill=(205, 205, 205, 235), anchor="lm")
+            x += cw + track
+    img.save(path, "PNG")
+
+
+async def _probe_duration(path: str) -> int:
+    probe = FFMPEG_BIN.replace("ffmpeg", "ffprobe") if "ffmpeg" in FFMPEG_BIN else "ffprobe"
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            probe, "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await asyncio.wait_for(proc.communicate(), 20)
+        return int(float(out.decode().strip()))
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _ffpath(p: str) -> str:
+    return p.replace("\\", "/").replace(":", r"\:").replace("'", r"\'")
+
+
+async def _render_overlay_video(audio_path: str, dur: int, title: str, out: Path) -> None:
+    w, h, fps = _VIDEO_SIZES.get(VIDEO_QUALITY, _VIDEO_SIZES["low"])
+    g = overlay_geometry(w, h)
+    png = out.with_suffix(".ovl.png")
+    font = pick_font()
+    ty = g["by"] + g["bh"] + int(h * 0.012)
+    total = float(max(1, dur))
+    last: Exception | None = None
+    try:
+        await asyncio.to_thread(render_overlay_png, png, w, h, title, total)
+        for with_clock in (True, False):
+            if with_clock and not font:
+                continue
+            graph = (
+                "[0:v][2:v]overlay=0:0[a];"
+                f"[3:v][4:v]overlay=x='-w+w*t/{total:.3f}':y=0[bar];"
+                f"[a][bar]overlay={g['bx']}:{g['by']}[b];"
+            )
+            if with_clock:
+                graph += (
+                    f"[b]drawtext=fontfile='{_ffpath(font)}':text='{_CLOCK_TEXT}':"
+                    f"x={g['bx']}:y={ty}:fontsize={g['ts']}:fontcolor=white[c];[c]format=yuv420p[v]"
+                )
+            else:
+                graph += "[b]format=yuv420p[v]"
+            args = [
+                "-stream_loop", "-1", "-i", str(VIDEO_LOOP_FILE),
+                "-i", audio_path,
+                "-loop", "1", "-framerate", str(fps), "-i", str(png),
+                "-f", "lavfi", "-i", f"color=c=0x5A5A5A:s={g['bw']}x{g['bh']}:r={fps}",
+                "-f", "lavfi", "-i", f"color=c=0xFFFFFF:s={g['bw']}x{g['bh']}:r={fps}",
+                "-filter_complex", graph, "-map", "[v]", "-map", "1:a:0",
+                "-c:v", "libx264", "-preset", "ultrafast", "-crf", "30", "-g", str(fps * 2),
+                "-c:a", "copy", "-t", f"{total + 1:.2f}", "-shortest", "-f", "matroska", str(out),
+            ]
+            try:
+                await _run_ffmpeg(args, timeout=min(1200, int(total * 1.5) + 150))
+                if out.exists() and out.stat().st_size > 0:
+                    return
+                last = RuntimeError("empty output")
+            except RuntimeError as exc:
+                last = exc
+                LOGGER.warning("Overlay render (clock=%s) failed: %s", with_clock, str(exc)[:200])
+            out.unlink(missing_ok=True)
+        raise last or RuntimeError("overlay render failed")
+    finally:
+        png.unlink(missing_ok=True)
+
+
+async def build_video_media(audio_path: str, duration: int, title: str = "") -> str | None:
     """Loop the owner's clip for the whole track and merge it with the audio.
 
-    Stream copy only (no re-encoding), so it takes about a second. The result
-    ends exactly when the audio ends, so the stream-end event still works.
+    With the overlay enabled the clip is re-encoded once (title, moving progress bar, time,
+    credit). Otherwise - or if that fails, or the track is too long - it is a plain stream
+    copy that takes about a second. Either way the file ends exactly when the audio ends.
     """
     if not video_enabled():
         return None
-    if duration and duration > VIDEO_MAX_TRACK_MINUTES * 60:
+    dur = duration or await _probe_duration(audio_path)
+    if dur and dur > VIDEO_MAX_TRACK_MINUTES * 60:
         return None
     out = Path(audio_path).with_suffix(".vid.mkv")
+    if get_flag("video_overlay") and dur and dur <= VIDEO_OVERLAY_MAX_MINUTES * 60:
+        try:
+            async with VIDEO_RENDER_SEMAPHORE:
+                await _render_overlay_video(audio_path, dur, title, out)
+            return str(out)
+        except Exception as exc:  # noqa: BLE001
+            LOGGER.warning("Overlay render failed, using the plain video: %s", str(exc)[:200])
+            out.unlink(missing_ok=True)
     try:
         await _run_ffmpeg(
             ["-stream_loop", "-1", "-i", str(VIDEO_LOOP_FILE), "-i", audio_path,
@@ -1674,10 +1987,7 @@ async def build_video_media(audio_path: str, duration: int) -> str | None:
             return str(out)
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Video merge failed, using audio only: %s", str(exc)[:200])
-    try:
-        out.unlink(missing_ok=True)
-    except OSError:
-        pass
+    out.unlink(missing_ok=True)
     return None
 
 
@@ -1924,7 +2234,7 @@ async def start_next(chat_id: int) -> bool:
                 file_path = await download_one(row["url"], row["title"] or "", int(row["duration"] or 0))
                 stream = None
                 if row_id not in NO_VIDEO_ROWS:
-                    merged = await build_video_media(file_path, int(row["duration"] or 0))
+                    merged = await build_video_media(file_path, int(row["duration"] or 0), row["title"] or "")
                     if merged:
                         try:
                             stream = AudioVideoPiped(
@@ -1951,7 +2261,7 @@ async def start_next(chat_id: int) -> bool:
                             try:
                                 await _join_call(a, chat_id, stream)
                                 break
-                            except (NoActiveGroupCall, UnMuteNeeded):
+                            except NoActiveGroupCall:
                                 raise
                             except Exception as join_exc:  # noqa: BLE001
                                 alt = await next_assistant(chat_id, tried)
@@ -1964,7 +2274,7 @@ async def start_next(chat_id: int) -> bool:
                                 spawn(
                                     notify_owner(
                                         f"assistant_join:{a.key}",
-                                        f"⚠️ تنبيه للمالك\n\nتعذر على المساعد {a.plain()} دخول المكالمة "
+                                        f"تنبيه للمالك\n\nتعذر على المساعد {a.plain()} دخول المكالمة"
                                         f"({type(join_exc).__name__})، تم التحويل تلقائيًا إلى {alt.plain()}.",
                                     )
                                 )
@@ -1978,11 +2288,14 @@ async def start_next(chat_id: int) -> bool:
                     await clear_now_playing(chat_id)
                     IN_CALL.discard(chat_id)
                     LOGGER.warning("Voice call failed: %s", type(exc).__name__)
-                    await send_temp(
-                        chat_id,
-                        "تعذر تشغيل المكالمة. تأكد من فتح Voice Chat أو Live Stream ومن صلاحيات المساعد.",
-                        ERROR_MESSAGE_SECONDS,
-                    )
+                    if isinstance(exc, UnMuteNeeded):
+                        hint = (
+                            "المساعد مكتوم في المحادثة الصوتية. فعّل خيار السماح للجميع بالتحدث "
+                            "في إعدادات المحادثة الصوتية، أو اجعل المساعد مشرفًا."
+                        )
+                    else:
+                        hint = "تعذر تشغيل المكالمة. تأكد من فتح Voice Chat أو Live Stream ومن صلاحيات المساعد."
+                    await send_temp(chat_id, hint, ERROR_MESSAGE_SECONDS)
                     return False
 
                 IN_CALL.add(chat_id)
@@ -2023,7 +2336,7 @@ async def ensure_call_permissions(message: Message) -> tuple[bool, str]:
         return False, "حساب المساعد غير متصل."
     if not await bot_is_admin(message.chat.id):
         return False, "يجب أن يكون البوت مشرفًا في هذه المحادثة."
-    a, reason = await pick_assistant(message.chat.id)
+    a, reason = await pick_assistant(message.chat.id, message.chat.type)
     if a is None:
         return False, reason
     return True, ""
@@ -2032,7 +2345,7 @@ async def ensure_call_permissions(message: Message) -> tuple[bool, str]:
 def _start_markup(message: Message) -> InlineKeyboardMarkup:
     markup = support_keyboard()
     if message.from_user and message.from_user.id == OWNER_ID and _is_private(message):
-        return InlineKeyboardMarkup([[_btn("🎛 لوحة التحكم", "pn:home")]] + list(markup.inline_keyboard))
+        return InlineKeyboardMarkup([[_btn("لوحة التحكم", "pn:home")]] + list(markup.inline_keyboard))
     return markup
 
 
@@ -2147,11 +2460,11 @@ async def _handle_control_impl(message: Message, action: str) -> None:
         if action == "pause":
             await set_paused(chat_id, True)
             await refresh_np_keyboard(chat_id)
-            return await reply_temp(message, "⏸ تم إيقاف التشغيل مؤقتًا.")
+            return await reply_temp(message, "تم إيقاف التشغيل مؤقتًا.")
         if action == "resume":
             await set_paused(chat_id, False)
             await refresh_np_keyboard(chat_id)
-            return await reply_temp(message, "▶️ تم استكمال التشغيل.")
+            return await reply_temp(message, "تم استكمال التشغيل.")
         if action == "skip":
             # Keep the current stream alive while the next item is downloaded.
             # start_next() will use change_stream() and then remove the old file.
@@ -2299,11 +2612,11 @@ async def callback_controls(_, query: CallbackQuery):
             want = {"pause_cb": True, "resume_cb": False}.get(data, chat_id not in PAUSED)
             await set_paused(chat_id, want)
             await refresh_np_keyboard(chat_id)
-            return await safe_answer(query, "⏸ تم الإيقاف المؤقت" if want else "▶️ تم الاستكمال")
+            return await safe_answer(query, "تم الإيقاف المؤقت" if want else "تم الاستكمال")
         if data == "skip_cb":
-            await safe_answer(query, "⏭ جارٍ التخطي...")
+            await safe_answer(query, "جارٍ التخطي...")
             return await action_skip(chat_id)
-        await safe_answer(query, "⏹ تم إنهاء التشغيل")
+        await safe_answer(query, "تم إنهاء التشغيل")
         await leave_and_clear(chat_id)
     except Exception as exc:
         LOGGER.exception("Callback control failed: %s", type(exc).__name__)
@@ -2319,7 +2632,7 @@ PANEL_PAGE_SIZE = 8
 
 
 def _onoff(value: bool) -> str:
-    return "✅ مفعّل" if value else "⛔ معطّل"
+    return "مفعّل" if value else "معطّل"
 
 
 def _mb(size: int) -> str:
@@ -2329,8 +2642,8 @@ def _mb(size: int) -> str:
 def _yt_state() -> str:
     if youtube_blocked():
         mins = max(1, (youtube_block_remaining() + 59) // 60)
-        return f"🚫 محظور (إعادة التجربة بعد {mins} د)"
-    return "✅ لا يوجد حظر معروف"
+        return f"محظور (إعادة التجربة بعد {mins} د)"
+    return "لا يوجد حظر معروف"
 
 
 def _find_assistant(key: str) -> Assistant | None:
@@ -2374,20 +2687,20 @@ async def panel_show(query: CallbackQuery, text: str, rows: list[list[InlineKeyb
 
 async def screen_home() -> Screen:
     ready, total = len(ready_assistants()), len(ASSISTANTS)
-    warn = "\n⚠️ <b>لا يوجد مساعد متصل، لن يعمل التشغيل.</b>" if ready == 0 else ""
+    warn = "\n<b>لا يوجد مساعد متصل، لن يعمل التشغيل.</b>" if ready == 0 else ""
     text = (
-        f"<b>🎛 لوحة تحكم {_esc(BOT_NAME)}</b>\n\n"
-        f"🤖 المساعدون: <b>{ready}/{total}</b> متصل\n"
-        f"🎧 تشغيل نشط: <b>{len(IN_CALL)}</b> محادثة\n"
-        f"▶️ يوتيوب: {_yt_state()}\n"
-        f"☁️ SoundCloud: {_onoff(soundcloud_enabled())}"
+        f"<b>لوحة تحكم {_esc(BOT_NAME)}</b>\n\n"
+        f"المساعدون: <b>{ready}/{total}</b> متصل\n"
+        f"تشغيل نشط: <b>{len(IN_CALL)}</b> محادثة\n"
+        f"يوتيوب: {_yt_state()}\n"
+        f"SoundCloud: {_onoff(soundcloud_enabled())}"
         f"{warn}\n\nاختر قسمًا:"
     )
     rows = [
-        [_btn("📊 الحالة", "pn:status"), _btn("🎧 التشغيل الآن", "pn:calls")],
-        [_btn("🤖 المساعدون", "pn:as"), _btn("🌐 المصادر", "pn:src")],
-        [_btn("💬 المحادثات", "pn:chats"), _btn("⚙️ الإعدادات", "pn:set")],
-        [_btn("🛠 الصيانة", "pn:maint"), _btn("✖️ إغلاق", "pn:close")],
+        [_btn("الحالة", "pn:status"), _btn("التشغيل الآن", "pn:calls")],
+        [_btn("المساعدون", "pn:as"), _btn("المصادر", "pn:src")],
+        [_btn("المحادثات", "pn:chats"), _btn("الإعدادات", "pn:set")],
+        [_btn("الصيانة", "pn:maint"), _btn("إغلاق", "pn:close")],
     ]
     return text, rows
 
@@ -2396,26 +2709,26 @@ async def screen_status() -> Screen:
     queued, playing = db_queue_totals()
     files, size = _temp_stats()
     text = (
-        "<b>📊 حالة البوت</b>\n\n"
-        f"⏱ مدة التشغيل: <b>{readable_time(int(time.time() - START_TIME))}</b>\n"
-        f"🤖 المساعدون: <b>{len(ready_assistants())}/{len(ASSISTANTS)}</b> متصل\n"
-        f"🎧 محادثات نشطة: <b>{len(IN_CALL)}</b>\n"
-        f"📋 في الانتظار: <b>{queued}</b> | قيد التشغيل: <b>{playing}</b>\n\n"
-        f"▶️ يوتيوب: {_yt_state()}\n"
-        f"☁️ SoundCloud: {_onoff(soundcloud_enabled())}\n"
-        f"🍪 كوكيز: <b>{len([p for p in YTDLP_COOKIE_FILES if os.path.isfile(p)])}</b> | "
-        f"🌐 بروكسي: <b>{len(YTDLP_PROXIES)}</b>\n\n"
-        f"🎬 فيديو العرض: {_video_state()}\n"
-        f"🗂 ملفات مؤقتة: <b>{files}</b> ({_mb(size)})\n"
-        f"🔒 الوضع: {'المسموح فقط' if get_flag('allowlist') else 'مفتوح للجميع'}"
+        "<b>حالة البوت</b>\n\n"
+        f"مدة التشغيل: <b>{readable_time(int(time.time() - START_TIME))}</b>\n"
+        f"المساعدون: <b>{len(ready_assistants())}/{len(ASSISTANTS)}</b> متصل\n"
+        f"محادثات نشطة: <b>{len(IN_CALL)}</b>\n"
+        f"في الانتظار: <b>{queued}</b> | قيد التشغيل: <b>{playing}</b>\n\n"
+        f"يوتيوب: {_yt_state()}\n"
+        f"SoundCloud: {_onoff(soundcloud_enabled())}\n"
+        f"كوكيز: <b>{len([p for p in YTDLP_COOKIE_FILES if os.path.isfile(p)])}</b> |"
+        f"بروكسي: <b>{len(YTDLP_PROXIES)}</b>\n\n"
+        f"فيديو العرض: {_video_state()}\n"
+        f"ملفات مؤقتة: <b>{files}</b> ({_mb(size)})\n"
+        f"الوضع: {'المسموح فقط' if get_flag('allowlist') else 'مفتوح للجميع'}"
     )
-    return text, [[_btn("🔄 تحديث", "pn:status"), _btn("🔙 رجوع", "pn:home")]]
+    return text, [[_btn("تحديث", "pn:status"), _btn("رجوع", "pn:home")]]
 
 
 async def screen_calls() -> Screen:
     chats = sorted(IN_CALL)[:PANEL_PAGE_SIZE]
     titles = await asyncio.gather(*(chat_title(c) for c in chats))
-    blocks = ["<b>🎧 التشغيل الآن</b>"]
+    blocks = ["<b>التشغيل الآن</b>"]
     rows: list[list[InlineKeyboardButton]] = []
     if not chats:
         blocks.append("لا يوجد تشغيل نشط حاليًا.")
@@ -2425,24 +2738,24 @@ async def screen_calls() -> Screen:
         track = _esc((cur["title"] if cur else "") or "—")
         paused = c in PAUSED
         blocks.append(
-            f"<b>{i}. {_esc(title)}</b>\n{'⏸' if paused else '▶️'} {track}\n"
-            f"🤖 {_esc(a.plain() if a else '-')} • ⏳ {queue_count(c)} بالانتظار"
+            f"<b>{i}. {_esc(title)}</b>\n{'متوقف مؤقتًا: ' if paused else 'يعمل: '}{track}\n"
+            f"المساعد: {_esc(a.plain() if a else '-')} | بالانتظار: {queue_count(c)}"
         )
         rows.append(
             [
-                _btn(f"{'▶️' if paused else '⏸'} {i}", f"pn:cpause:{c}"),
-                _btn(f"⏭ {i}", f"pn:cskip:{c}"),
-                _btn(f"⏹ {i}", f"pn:cstop:{c}"),
+                _btn(f"{'استكمال' if paused else 'إيقاف'} {i}", f"pn:cpause:{c}"),
+                _btn(f"تخطي {i}", f"pn:cskip:{c}"),
+                _btn(f"إنهاء {i}", f"pn:cstop:{c}"),
             ]
         )
     if len(IN_CALL) > len(chats):
         blocks.append(f"... و{len(IN_CALL) - len(chats)} محادثات أخرى")
-    rows.append([_btn("🔄 تحديث", "pn:calls"), _btn("🔙 رجوع", "pn:home")])
+    rows.append([_btn("تحديث", "pn:calls"), _btn("رجوع", "pn:home")])
     return "\n\n".join(blocks), rows
 
 
 async def screen_assistants(note: str = "") -> Screen:
-    lines = ["<b>🤖 حسابات المساعد</b>", ""]
+    lines = ["<b>حسابات المساعد</b>", ""]
     if not ASSISTANTS:
         lines.append("لا توجد حسابات. أضف حسابًا ليعمل التشغيل.")
     else:
@@ -2450,11 +2763,11 @@ async def screen_assistants(note: str = "") -> Screen:
     if note:
         lines += ["", note]
     rows = [
-        [_btn(f"{'🟢' if a.ready else '🔴'} {a.plain()} • {assistant_load(a)} نشط", f"pn:asv:{a.key}")]
+        [_btn(f"{a.plain()} - {'متصل' if a.ready else 'غير متصل'} - {assistant_load(a)} نشط", f"pn:asv:{a.key}")]
         for a in ASSISTANTS
     ]
-    rows.append([_btn("➕ إضافة حساب", "pn:asadd"), _btn("🔄 إعادة اتصال الكل", "pn:asre")])
-    rows.append([_btn("🔙 رجوع", "pn:home")])
+    rows.append([_btn("إضافة حساب", "pn:asadd"), _btn("إعادة اتصال الكل", "pn:asre")])
+    rows.append([_btn("رجوع", "pn:home")])
     return "\n".join(lines), rows
 
 
@@ -2464,10 +2777,10 @@ async def screen_assistant(key: str) -> Screen:
         return await screen_assistants("الحساب غير موجود.")
     active = [c for c, x in CHAT_ASSISTANT.items() if x is a and c in IN_CALL]
     titles = await asyncio.gather(*(chat_title(c) for c in active))
-    state = "🟢 متصل" if a.ready else f"🔴 غير متصل{f' ({_esc(a.error)})' if a.error else ''}"
+    state = "متصل" if a.ready else f"غير متصل{f' ({_esc(a.error)})' if a.error else ''}"
     src = "متغيرات الاستضافة" if a.source == "env" else "أُضيف من اللوحة"
     lines = [
-        f"<b>🤖 {_esc(a.display())}</b>",
+        f"<b>{_esc(a.display())}</b>",
         "",
         f"الحالة: {state}",
         f"الاسم: {_esc(a.name or '-')}",
@@ -2476,62 +2789,63 @@ async def screen_assistant(key: str) -> Screen:
         f"محادثات نشطة: <b>{len(active)}</b>",
     ]
     lines += [f"• {_esc(t)}" for t in titles[:6]]
-    rows = [[_btn("🔄 إعادة اتصال", f"pn:asre1:{key}")]]
+    rows = [[_btn("إعادة اتصال", f"pn:asre1:{key}")]]
     if a.source == "db":
-        rows[0].append(_btn("🗑 حذف", f"pn:asdel:{key}"))
+        rows[0].append(_btn("حذف", f"pn:asdel:{key}"))
     else:
-        lines += ["", "ℹ️ هذا الحساب من متغيرات الاستضافة، يُحذف من إعدادات Railway."]
-    rows.append([_btn("🔙 الحسابات", "pn:as")])
+        lines += ["", "هذا الحساب من متغيرات الاستضافة، يُحذف من إعدادات Railway."]
+    rows.append([_btn("الحسابات", "pn:as")])
     return "\n".join(lines), rows
 
 
 async def screen_sources(note: str = "") -> Screen:
     cookies = len([p for p in YTDLP_COOKIE_FILES if os.path.isfile(p)])
     text = (
-        "<b>🌐 مصادر التشغيل</b>\n\n"
-        f"▶️ يوتيوب: {_yt_state()}\n"
-        f"☁️ SoundCloud (بديل تلقائي): {_onoff(soundcloud_enabled())}\n"
-        f"🍪 حسابات الكوكيز: <b>{cookies}</b>\n"
-        f"🌐 البروكسيات: <b>{len(YTDLP_PROXIES)}</b>\n\n"
+        "<b>مصادر التشغيل</b>\n\n"
+        f"يوتيوب: {_yt_state()}\n"
+        f"SoundCloud (بديل تلقائي): {_onoff(soundcloud_enabled())}\n"
+        f"حسابات الكوكيز: <b>{cookies}</b>\n"
+        f"البروكسيات: <b>{len(YTDLP_PROXIES)}</b>\n\n"
         "عند حظر يوتيوب يتحول البوت تلقائيًا إلى SoundCloud دون أي إشعار في المجموعات."
     )
     if cookies == 0 and not YTDLP_PROXIES:
-        text += "\n\n💡 للحل الدائم أضف YTDLP_COOKIES_B64 أو YTDLP_PROXIES في Railway."
+        text += "\n\nللحل الدائم أضف YTDLP_COOKIES_B64 أو YTDLP_PROXIES في Railway."
     if note:
         text += f"\n\n<b>نتيجة الاختبار:</b>\n{note}"
     rows = [
-        [_btn(f"☁️ SoundCloud: {'تعطيل' if soundcloud_enabled() else 'تفعيل'}", "pn:togs:soundcloud")],
-        [_btn("🧪 اختبار يوتيوب", "pn:testyt"), _btn("🧪 اختبار SoundCloud", "pn:testsc")],
-        [_btn("🔁 إعادة تجربة يوتيوب الآن", "pn:ytreset")],
-        [_btn("🔙 رجوع", "pn:home")],
+        [_btn(f"SoundCloud: {'تعطيل' if soundcloud_enabled() else 'تفعيل'}", "pn:togs:soundcloud")],
+        [_btn("اختبار يوتيوب", "pn:testyt"), _btn("اختبار SoundCloud", "pn:testsc")],
+        [_btn("إعادة تجربة يوتيوب الآن", "pn:ytreset")],
+        [_btn("رجوع", "pn:home")],
     ]
     return text, rows
 
 
 _TOGGLE_LABELS = {
-    "auto_delete": "🧹 حذف أوامر المستخدمين",
-    "owner_alerts": "🔔 تنبيهات المالك",
-    "soundcloud": "☁️ بديل SoundCloud",
-    "allowlist": "🔒 المحادثات المسموحة فقط",
+    "auto_delete": "حذف أوامر المستخدمين",
+    "owner_alerts": "تنبيهات المالك",
+    "soundcloud": "بديل SoundCloud",
+    "allowlist": "المحادثات المسموحة فقط",
+    "video_overlay": "شريط التقدم على الفيديو",
 }
 
 
 async def screen_settings() -> Screen:
     text = (
-        "<b>⚙️ الإعدادات</b>\n\n"
+        "<b>الإعدادات</b>\n\n"
         "اضغط على أي إعداد لتبديله. تُحفظ التغييرات وتبقى بعد إعادة التشغيل.\n\n"
-        "🧹 حذف أوامر المستخدمين: يمسح رسالة الأمر بعد تنفيذه.\n"
-        "🔔 تنبيهات المالك: رسائل الأعطال التي تصلك في الخاص.\n"
-        "🔒 المسموحة فقط: لا يعمل البوت إلا في المحادثات التي توافق عليها.\n"
-        "🎬 فيديو العرض: يُعيَّن بإرسال وسيط مع /setvideo."
+        "حذف أوامر المستخدمين: يمسح رسالة الأمر بعد تنفيذه.\n"
+        "تنبيهات المالك: رسائل الأعطال التي تصلك في الخاص.\n"
+        "المسموحة فقط: لا يعمل البوت إلا في المحادثات التي توافق عليها.\n"
+        "شريط التقدم: يعرض اسم الأغنية وشريطًا متحركًا والحقوق فوق الفيديو (يحتاج فيديو معيّنًا).\n"
+        "فيديو العرض: يُعيَّن بإرسال وسيط مع /setvideo."
     )
-    rows = [[_btn(f"{label}: {'✅' if get_flag(key) else '⛔'}", f"pn:tog:{key}")] for key, label in _TOGGLE_LABELS.items()]
-    rows.append([_btn(f"🎬 فيديو العرض: {_video_state()}", "pn:tog:video")])
-    rows.append([_btn("🔙 رجوع", "pn:home")])
+    rows = [[_btn(f"{label}: {'مفعّل' if get_flag(key) else 'معطّل'}", f"pn:tog:{key}")] for key, label in _TOGGLE_LABELS.items()]
+    rows.append([_btn(f"فيديو العرض: {_video_state()}", "pn:tog:video")])
+    rows.append([_btn("رجوع", "pn:home")])
     return text, rows
 
 
-_CHAT_ICON = {1: "✅", 0: "🚫", 2: "⏳"}
 _CHAT_LABEL = {1: "مسموحة", 0: "محظورة", 2: "بانتظار الموافقة"}
 
 
@@ -2540,14 +2854,14 @@ async def screen_chats() -> Screen:
     pending = sum(1 for r in rows_db if int(r["enabled"]) == 2)
     mode = get_flag("allowlist")
     text = (
-        "<b>💬 المحادثات</b>\n\n"
-        f"الوضع: {'🔒 المسموحة فقط' if mode else '🔓 مفتوح للجميع'}\n"
+        "<b>المحادثات</b>\n\n"
+        f"الوضع: {'المسموحة فقط' if mode else 'مفتوح للجميع'}\n"
         f"المسجّلة: <b>{len(rows_db)}</b>" + (f" | بانتظار الموافقة: <b>{pending}</b>" if pending else "")
     )
     shown = rows_db[:PANEL_PAGE_SIZE]
     titles = await asyncio.gather(*(chat_title(int(r["chat_id"])) for r in shown))
     rows = [
-        [_btn(f"{_CHAT_ICON.get(int(r['enabled']), '❔')} {t[:30]}", f"pn:chat:{r['chat_id']}")]
+        [_btn(f"{t[:26]} - {_CHAT_LABEL.get(int(r['enabled']), '-')}", f"pn:chat:{r['chat_id']}")]
         for r, t in zip(shown, titles)
     ]
     if len(rows_db) > len(shown):
@@ -2555,8 +2869,8 @@ async def screen_chats() -> Screen:
     if not rows_db:
         text += "\n\nلا توجد محادثات مسجّلة بعد. تُسجَّل تلقائيًا عند أول استخدام."
     text += "\n\nتلميح: أرسل /allow أو /deny داخل أي مجموعة للتحكم بها مباشرة."
-    rows.append([_btn("➕ إضافة بالمعرّف", "pn:chadd"), _btn("🔒 تبديل الوضع" if not mode else "🔓 تبديل الوضع", "pn:chmode")])
-    rows.append([_btn("🔙 رجوع", "pn:home")])
+    rows.append([_btn("إضافة بالمعرّف", "pn:chadd"), _btn("تبديل الوضع", "pn:chmode")])
+    rows.append([_btn("رجوع", "pn:home")])
     return text, rows
 
 
@@ -2567,15 +2881,15 @@ async def screen_chat(chat_id: int) -> Screen:
     enabled = int(row["enabled"])
     title = await chat_title(chat_id)
     text = (
-        f"<b>💬 {_esc(title)}</b>\n\n"
+        f"<b>{_esc(title)}</b>\n\n"
         f"المعرّف: <code>{chat_id}</code>\n"
-        f"الحالة: {_CHAT_ICON.get(enabled, '❔')} {_CHAT_LABEL.get(enabled, '-')}\n"
+        f"الحالة: {_CHAT_LABEL.get(enabled, '-')}\n"
         f"تشغيل نشط الآن: {'نعم' if chat_id in IN_CALL else 'لا'}"
     )
     rows = [
-        [_btn("✅ سماح", f"pn:chset:{chat_id}:1"), _btn("🚫 حظر", f"pn:chset:{chat_id}:0")],
-        [_btn("🗑 حذف من السجل", f"pn:chdel:{chat_id}")],
-        [_btn("🔙 المحادثات", "pn:chats")],
+        [_btn("سماح", f"pn:chset:{chat_id}:1"), _btn("حظر", f"pn:chset:{chat_id}:0")],
+        [_btn("حذف من السجل", f"pn:chdel:{chat_id}")],
+        [_btn("المحادثات", "pn:chats")],
     ]
     return text, rows
 
@@ -2584,23 +2898,23 @@ async def screen_maintenance(note: str = "") -> Screen:
     queued, _playing = db_queue_totals()
     files, size = _temp_stats()
     text = (
-        "<b>🛠 الصيانة</b>\n\n"
-        f"🗂 ملفات مؤقتة: <b>{files}</b> ({_mb(size)})\n"
-        f"📋 مقاطع في الانتظار: <b>{queued}</b>"
+        "<b>الصيانة</b>\n\n"
+        f"ملفات مؤقتة: <b>{files}</b> ({_mb(size)})\n"
+        f"مقاطع في الانتظار: <b>{queued}</b>"
     )
     if note:
         text += f"\n\n{note}"
     rows = [
-        [_btn("🧹 تنظيف الملفات المؤقتة", "pn:mclean")],
-        [_btn("🗑 مسح كل قوائم الانتظار", "pn:mclearq")],
-        [_btn("🔄 إعادة اتصال كل المساعدين", "pn:asre")],
-        [_btn("🔙 رجوع", "pn:home")],
+        [_btn("تنظيف الملفات المؤقتة", "pn:mclean")],
+        [_btn("مسح كل قوائم الانتظار", "pn:mclearq")],
+        [_btn("إعادة اتصال كل المساعدين", "pn:asre")],
+        [_btn("رجوع", "pn:home")],
     ]
     return text, rows
 
 
 def _confirm(text: str, yes: str, no: str) -> Screen:
-    return text, [[_btn("✅ نعم، تأكيد", yes), _btn("❌ إلغاء", no)]]
+    return text, [[_btn("نعم، تأكيد", yes), _btn("إلغاء", no)]]
 
 
 async def _cancel_owner_flows() -> None:
@@ -2618,20 +2932,20 @@ async def _test_youtube() -> str:
     try:
         await asyncio.wait_for(asyncio.to_thread(youtube_info, _TEST_VIDEO_URL), 75)
         note_youtube_ok()
-        return f"✅ يوتيوب يعمل ({time.monotonic() - t0:.1f} ث)"
+        return f"يوتيوب يعمل ({time.monotonic() - t0:.1f} ث)"
     except Exception as exc:  # noqa: BLE001
         if _is_bot_check(exc):
-            return "🚫 يوتيوب يرفض هذا الخادم (Bot check). التحويل إلى SoundCloud فعّال."
-        return f"⚠️ فشل الاختبار: {_esc(str(exc)[:160])}"
+            return "يوتيوب يرفض هذا الخادم (Bot check). التحويل إلى SoundCloud فعّال."
+        return f"فشل الاختبار: {_esc(str(exc)[:160])}"
 
 
 async def _test_soundcloud() -> str:
     t0 = time.monotonic()
     try:
         results = await asyncio.wait_for(asyncio.to_thread(soundcloud_search, "music", 1), 40)
-        return f"✅ SoundCloud يعمل ({time.monotonic() - t0:.1f} ث) • {_esc((results[0].get('title') or '')[:40])}"
+        return f"SoundCloud يعمل ({time.monotonic() - t0:.1f} ث) • {_esc((results[0].get('title') or '')[:40])}"
     except Exception as exc:  # noqa: BLE001
-        return f"⚠️ فشل الاختبار: {_esc(str(exc)[:160])}"
+        return f"فشل الاختبار: {_esc(str(exc)[:160])}"
 
 
 async def _reconnect(a: Assistant) -> bool:
@@ -2661,14 +2975,14 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
         if action == "cpause":
             await set_paused(chat_id, chat_id not in PAUSED)
             await refresh_np_keyboard(chat_id)
-            toast = "⏸ تم الإيقاف المؤقت" if chat_id in PAUSED else "▶️ تم الاستكمال"
+            toast = "تم الإيقاف المؤقت" if chat_id in PAUSED else "تم الاستكمال"
         elif action == "cskip":
-            await panel_show(query, "⏳ جارٍ التخطي...", [])
+            await panel_show(query, "جارٍ التخطي...", [])
             await action_skip(chat_id)
-            toast = "⏭ تم التخطي"
+            toast = "تم التخطي"
         else:
             await leave_and_clear(chat_id)
-            toast = "⏹ تم إنهاء التشغيل"
+            toast = "تم إنهاء التشغيل"
         screen = await screen_calls()
     elif action == "as":
         screen = await screen_assistants()
@@ -2679,15 +2993,15 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
             return f"وصلت للحد الأقصى ({MAX_ASSISTANTS})"
         LOGIN_STATE[OWNER_ID] = {"step": "phone", "created": time.monotonic()}
         screen = (
-            "<b>➕ إضافة حساب مساعد</b>\n\nأرسل رقم هاتف الحساب بصيغة دولية، مثل <code>+9665XXXXXXXX</code>.\n"
+            "<b>إضافة حساب مساعد</b>\n\nأرسل رقم هاتف الحساب بصيغة دولية، مثل <code>+9665XXXXXXXX</code>.\n"
             "سيصلك رمز التحقق على الحساب نفسه.",
-            [[_btn("❌ إلغاء", "pn:ascancel")]],
+            [[_btn("إلغاء", "pn:ascancel")]],
         )
     elif action == "ascancel":
         await _cancel_owner_flows()
         screen = await screen_assistants("تم إلغاء العملية.")
     elif action == "asre":
-        await panel_show(query, "⏳ جارٍ إعادة اتصال المساعدين...", [])
+        await panel_show(query, "جارٍ إعادة اتصال المساعدين...", [])
         results = [await _reconnect(a) for a in list(ASSISTANTS)]
         toast = f"تم: {sum(results)}/{len(results)} متصل"
         screen = await screen_assistants()
@@ -2696,8 +3010,8 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
         if a is None:
             screen = await screen_assistants("الحساب غير موجود.")
         else:
-            await panel_show(query, f"⏳ جارٍ إعادة اتصال {_esc(a.plain())}...", [])
-            toast = "✅ تم الاتصال" if await _reconnect(a) else "❌ فشل الاتصال"
+            await panel_show(query, f"جارٍ إعادة اتصال {_esc(a.plain())}...", [])
+            toast = "تم الاتصال" if await _reconnect(a) else "فشل الاتصال"
             screen = await screen_assistant(arg)
     elif action == "asdel":
         a = _find_assistant(arg)
@@ -2714,7 +3028,7 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
         if a is not None and a.source == "db":
             name = a.plain()
             await remove_assistant(a)
-            screen = await screen_assistants(f"🗑 تم حذف {_esc(name)}.")
+            screen = await screen_assistants(f"تم حذف {_esc(name)}.")
         else:
             screen = await screen_assistants("الحساب غير موجود.")
     elif action == "src":
@@ -2724,10 +3038,10 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
         toast = f"SoundCloud: {'مفعّل' if get_flag('soundcloud') else 'معطّل'}"
         screen = await screen_sources()
     elif action == "testyt":
-        await panel_show(query, "⏳ جارٍ اختبار يوتيوب (قد يستغرق دقيقة)...", [])
+        await panel_show(query, "جارٍ اختبار يوتيوب (قد يستغرق دقيقة)...", [])
         screen = await screen_sources(await _test_youtube())
     elif action == "testsc":
-        await panel_show(query, "⏳ جارٍ اختبار SoundCloud...", [])
+        await panel_show(query, "جارٍ اختبار SoundCloud...", [])
         screen = await screen_sources(await _test_soundcloud())
     elif action == "ytreset":
         reset_youtube_block()
@@ -2749,14 +3063,14 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
         screen = await screen_chats()
     elif action == "chmode":
         set_flag("allowlist", not get_flag("allowlist"))
-        toast = "🔒 المسموحة فقط" if get_flag("allowlist") else "🔓 مفتوح للجميع"
+        toast = "المسموحة فقط" if get_flag("allowlist") else "مفتوح للجميع"
         screen = await screen_chats()
     elif action == "chadd":
         PANEL_INPUT[OWNER_ID] = {"kind": "chat_add", "created": time.monotonic()}
         screen = (
-            "<b>➕ إضافة محادثة</b>\n\nأرسل معرّف المحادثة (رقم يبدأ عادةً بـ <code>-100</code>).\n"
+            "<b>إضافة محادثة</b>\n\nأرسل معرّف المحادثة (رقم يبدأ عادةً بـ <code>-100</code>).\n"
             "أو أرسل /allow داخل المجموعة مباشرة.",
-            [[_btn("❌ إلغاء", "pn:chats_cancel")]],
+            [[_btn("إلغاء", "pn:chats_cancel")]],
         )
     elif action == "chats_cancel":
         PANEL_INPUT.pop(OWNER_ID, None)
@@ -2770,11 +3084,11 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
         db_set_chat(chat_id, row["chat_type"] if row else "group", enabled)
         if enabled == 0 and chat_id in IN_CALL:
             await leave_and_clear(chat_id)
-        toast = "✅ تم السماح" if enabled else "🚫 تم الحظر"
+        toast = "تم السماح" if enabled else "تم الحظر"
         screen = await screen_chat(chat_id)
     elif action == "chdel":
         db_del_chat(int(arg))
-        toast = "🗑 تم الحذف من السجل"
+        toast = "تم الحذف من السجل"
         screen = await screen_chats()
     elif action == "maint":
         screen = await screen_maintenance()
@@ -2787,7 +3101,7 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
             except OSError:
                 pass
         removed = await asyncio.to_thread(cleanup_temp_files, 120, protected)
-        screen = await screen_maintenance(f"🧹 تم حذف <b>{removed}</b> ملف مؤقت.")
+        screen = await screen_maintenance(f"تم حذف <b>{removed}</b> ملف مؤقت.")
     elif action == "mclearq":
         queued, _p = db_queue_totals()
         screen = _confirm(
@@ -2803,7 +3117,7 @@ async def panel_dispatch(query: CallbackQuery, action: str, arg: str) -> str | N
             cleared = cur.rowcount
         finally:
             conn.close()
-        screen = await screen_maintenance(f"🗑 تم مسح <b>{cleared}</b> مقطعًا من قوائم الانتظار.")
+        screen = await screen_maintenance(f"تم مسح <b>{cleared}</b> مقطعًا من قوائم الانتظار.")
     else:
         screen = await screen_home()
 
@@ -2857,7 +3171,7 @@ async def panel_input(_, message: Message):
         db_set_chat(chat_id, "group", 1)
         text, rows = await screen_chat(chat_id)
         await message.reply_text(
-            "✅ تمت إضافة المحادثة وتفعيلها.\n\n" + text,
+            "تمت إضافة المحادثة وتفعيلها.\n\n" + text,
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
         )
@@ -2875,7 +3189,7 @@ async def chat_access_command(_, message: Message):
             CHAT_TITLES[message.chat.id] = message.chat.title
         if not allow and message.chat.id in IN_CALL:
             await leave_and_clear(message.chat.id)
-        await reply_temp(message, "✅ تم السماح للمحادثة." if allow else "🚫 تم حظر المحادثة.")
+        await reply_temp(message, "تم السماح للمحادثة." if allow else "تم حظر المحادثة.")
     finally:
         delete_command(message)
 
@@ -3046,6 +3360,7 @@ async def startup() -> None:
     BOT_ID = me.id
     BOT_USERNAME = me.username or ""
     BOT_MENTION = me.mention
+    spawn(asyncio.to_thread(ensure_fonts))
     await start_all_assistants()
     await purge_stale_now_playing()
     await restore_loop_video()
