@@ -1732,6 +1732,9 @@ async def make_loop_video(source: str, is_image: bool) -> None:
 # track's video once (ffmpeg), so pause / resume stay perfectly in sync.
 # Needs:  Pillow   (and arabic-reshaper + python-bidi for correct Arabic titles)
 # ---------------------------------------------------------------------------
+import importlib.util
+
+OVERLAY_AVAILABLE = importlib.util.find_spec("PIL") is not None
 VIDEO_CREDIT = os.getenv("VIDEO_CREDIT", "KroTheCommander").strip()
 VIDEO_OVERLAY_MAX_MINUTES = int(os.getenv("VIDEO_OVERLAY_MAX_MINUTES", "12"))
 VIDEO_RENDER_SEMAPHORE = asyncio.Semaphore(max(1, int(os.getenv("VIDEO_RENDER_CONCURRENCY", "2"))))
@@ -1889,6 +1892,31 @@ def render_overlay_png(path: Path, w: int, h: int, title: str, total_seconds: fl
     img.save(path, "PNG")
 
 
+async def init_overlay() -> None:
+    """Startup check for the video overlay: never raises, tells the OWNER what is missing."""
+    if not OVERLAY_AVAILABLE:
+        LOGGER.warning("Video overlay disabled: Pillow is not installed")
+        await notify_owner(
+            "overlay_deps",
+            "تنبيه للمالك\n\nشريط التقدم على الفيديو معطل لأن مكتبة Pillow غير مثبتة.\n"
+            "أضف هذه الأسطر إلى requirements.txt ثم أعد النشر:\nPillow\narabic-reshaper\npython-bidi\n\n"
+            "إلى ذلك الحين يعمل الفيديو العادي بدون شريط.",
+            604800,
+        )
+        return
+    try:
+        await asyncio.to_thread(ensure_fonts)
+    except Exception as exc:  # noqa: BLE001
+        LOGGER.warning("Font setup failed: %s", type(exc).__name__)
+    if _ar is None or _bidi_display is None:
+        await notify_owner(
+            "overlay_arabic",
+            "تنبيه للمالك\n\nلن تظهر عناوين الأغاني العربية على الفيديو بشكل صحيح حتى تضيف "
+            "arabic-reshaper و python-bidi إلى requirements.txt.",
+            604800,
+        )
+
+
 async def _probe_duration(path: str) -> int:
     probe = FFMPEG_BIN.replace("ffmpeg", "ffprobe") if "ffmpeg" in FFMPEG_BIN else "ffprobe"
     try:
@@ -1968,7 +1996,7 @@ async def build_video_media(audio_path: str, duration: int, title: str = "") -> 
     if dur and dur > VIDEO_MAX_TRACK_MINUTES * 60:
         return None
     out = Path(audio_path).with_suffix(".vid.mkv")
-    if get_flag("video_overlay") and dur and dur <= VIDEO_OVERLAY_MAX_MINUTES * 60:
+    if OVERLAY_AVAILABLE and get_flag("video_overlay") and dur and dur <= VIDEO_OVERLAY_MAX_MINUTES * 60:
         try:
             async with VIDEO_RENDER_SEMAPHORE:
                 await _render_overlay_video(audio_path, dur, title, out)
@@ -3360,7 +3388,7 @@ async def startup() -> None:
     BOT_ID = me.id
     BOT_USERNAME = me.username or ""
     BOT_MENTION = me.mention
-    spawn(asyncio.to_thread(ensure_fonts))
+    spawn(init_overlay())
     await start_all_assistants()
     await purge_stale_now_playing()
     await restore_loop_video()
