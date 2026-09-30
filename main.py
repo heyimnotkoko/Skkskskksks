@@ -92,6 +92,11 @@ OWNER_ALERT_COOLDOWN = int(os.getenv("OWNER_ALERT_COOLDOWN", "1800"))
 # After YouTube blocks the server IP, go straight to SoundCloud for this many seconds
 # before trying YouTube again.
 YT_BLOCK_COOLDOWN = int(os.getenv("YT_BLOCK_COOLDOWN", "600"))
+# The bot keeps playing even when it is not allowed to write in a chat. After a failed
+# send, further sends to that chat are skipped for this many seconds (no wasted calls).
+MUTED_CHAT_SECONDS = int(os.getenv("MUTED_CHAT_SECONDS", "600"))
+# Tell the owner privately about chats where the bot cannot write (off by default).
+NOTIFY_CANNOT_SEND = os.getenv("NOTIFY_CANNOT_SEND", "0").strip().lower() in {"1", "true", "yes"}
 
 logging.basicConfig(
     level=logging.INFO,
@@ -549,30 +554,51 @@ class MutedMessage:
         return self
 
 
+MUTED_CHATS: dict[int, float] = {}   # chat_id -> monotonic time until which sends are skipped
+
+
+def is_muted_chat(chat_id: int) -> bool:
+    until = MUTED_CHATS.get(chat_id)
+    if until is None:
+        return False
+    if time.monotonic() >= until:
+        MUTED_CHATS.pop(chat_id, None)
+        return False
+    return True
+
+
 async def report_cannot_send(chat_id: int, exc: Exception) -> None:
     """The bot cannot post in this chat (e.g. a channel where it is admin without the
-    'Post messages' right). Tell the OWNER privately, once in a while - never the chat."""
-    LOGGER.warning("Cannot send to chat %s: %s", chat_id, type(exc).__name__)
+    'Post messages' right). Playback carries on silently; we just remember it for a while."""
+    first = not is_muted_chat(chat_id)
+    MUTED_CHATS[chat_id] = time.monotonic() + MUTED_CHAT_SECONDS
+    if first:
+        LOGGER.info("Cannot send to chat %s (%s); continuing silently", chat_id, type(exc).__name__)
+    if not NOTIFY_CANNOT_SEND:
+        return
     title = await chat_title(chat_id)
-    try:
-        await notify_owner(
-            f"cant_send:{chat_id}",
-            "تنبيه للمالك\n\n"
-            f"لا يستطيع البوت إرسال رسائل في: {title}\n({chat_id})\n"
-            f"السبب: {type(exc).__name__}\n\n"
-            "الحل: من إعدادات المشرفين في تلك المحادثة فعّل للبوت صلاحية إرسال الرسائل "
-            "(Post Messages). التشغيل الصوتي يستمر بصمت في هذه الأثناء.",
-            21600,
-        )
-    except Exception as owner_exc:
-        LOGGER.debug("Owner notification skipped: %s", type(owner_exc).__name__)
+    await notify_owner(
+        f"cant_send:{chat_id}",
+        "تنبيه للمالك\n\n"
+        f"لا يستطيع البوت إرسال رسائل في: {title}\n({chat_id})\n"
+        f"السبب: {type(exc).__name__}\n\n"
+        "التشغيل الصوتي يستمر بصمت في هذه الأثناء.",
+        21600,
+    )
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Any:
+    chat = getattr(message, "chat", None)
+    chat_id = getattr(chat, "id", 0)
+    if chat_id and chat is not None and chat.type != ChatType.PRIVATE and is_muted_chat(chat_id):
+        return MutedMessage()
     try:
         return await message.reply_text(text, **kwargs)
-    except RPCError as exc:
-        spawn(report_cannot_send(message.chat.id, exc))
+    except Exception as exc:  # noqa: BLE001 - never let a failed reply stop the music
+        if isinstance(exc, RPCError) and chat_id:
+            spawn(report_cannot_send(chat_id, exc))
+        else:
+            LOGGER.warning("Reply failed: %s", type(exc).__name__)
         return MutedMessage()
 
 
@@ -584,11 +610,13 @@ async def reply_temp(message: Message, text: str, delay: float | None = None, **
 
 
 async def send_temp(chat_id: int, text: str, delay: float = TEMP_MESSAGE_SECONDS) -> None:
+    if is_muted_chat(chat_id):
+        return
     try:
         msg = await app.send_message(chat_id, text)
         spawn(_delete_after(chat_id, msg.id, delay))
     except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Temp message failed: %s", type(exc).__name__)
+        LOGGER.debug("Temp message failed: %s", type(exc).__name__)
         if isinstance(exc, RPCError):
             spawn(report_cannot_send(chat_id, exc))
 
@@ -1608,6 +1636,8 @@ def now_playing_text(row: sqlite3.Row) -> str:
 
 
 async def update_now_playing(chat_id: int, row: sqlite3.Row) -> None:
+    if is_muted_chat(chat_id):
+        return
     text = now_playing_text(row)
     old_id = NOW_PLAYING.get(chat_id)
     if old_id:
@@ -1621,7 +1651,7 @@ async def update_now_playing(chat_id: int, row: sqlite3.Row) -> None:
         NOW_PLAYING[chat_id] = msg.id
         db_set_setting(f"np:{chat_id}", str(msg.id))
     except RPCError as exc:
-        LOGGER.warning("Now playing message failed: %s", type(exc).__name__)
+        LOGGER.debug("Now playing message failed: %s", type(exc).__name__)
         spawn(report_cannot_send(chat_id, exc))
 
 
@@ -2067,20 +2097,20 @@ async def restore_loop_video() -> None:
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.command(["setvideo", "تعيين_فيديو"]))
 async def setvideo_handler(_, message: Message):
     if AudioVideoPiped is None:
-        return await message.reply_text(
+        return await safe_reply(message, 
             "نسخة pytgcalls المثبتة لا تدعم بث الفيديو.\n" f"`{VIDEO_IMPORT_ERROR}`"
         )
     src = message if _extract_media(message) else message.reply_to_message
     media = _extract_media(src)
     if not media:
-        return await message.reply_text(
+        return await safe_reply(message, 
             "أرسل صورة أو GIF أو فيديو قصيرًا مع التعليق /setvideo\n"
             "أو ردّ على وسيط موجود بالأمر /setvideo"
         )
     kind, size, file_id = media
     if size and size > VIDEO_SOURCE_MAX_MB * 1024 * 1024:
-        return await message.reply_text(f"الملف كبير جدًا. الحد الأقصى {VIDEO_SOURCE_MAX_MB} MB.")
-    status = await message.reply_text("جاري تجهيز الفيديو...")
+        return await safe_reply(message, f"الملف كبير جدًا. الحد الأقصى {VIDEO_SOURCE_MAX_MB} MB.")
+    status = await safe_reply(message, "جاري تجهيز الفيديو...")
     tmp = None
     try:
         tmp = await app.download_media(src, file_name=str(VIDEO_DIR / f"src_{uuid.uuid4().hex}"))
@@ -2107,19 +2137,19 @@ async def delvideo_handler(_, message: Message):
         VIDEO_LOOP_FILE.unlink(missing_ok=True)
     except OSError:
         pass
-    await message.reply_text("تم حذف الفيديو. سيعود التشغيل بالصوت فقط.")
+    await safe_reply(message, "تم حذف الفيديو. سيعود التشغيل بالصوت فقط.")
 
 
 @app.on_message(filters.private & filters.user(OWNER_ID) & filters.command(["videoinfo"]))
 async def videoinfo_handler(_, message: Message):
     if AudioVideoPiped is None:
-        return await message.reply_text("بث الفيديو غير مدعوم في نسخة pytgcalls الحالية.")
+        return await safe_reply(message, "بث الفيديو غير مدعوم في نسخة pytgcalls الحالية.")
     if not video_enabled():
-        return await message.reply_text("لا يوجد فيديو معيّن. أرسل وسيطًا مع /setvideo")
+        return await safe_reply(message, "لا يوجد فيديو معيّن. أرسل وسيطًا مع /setvideo")
     kind = "صورة" if db_get_setting("video_kind") == "image" else "فيديو/GIF"
     size_kb = VIDEO_LOOP_FILE.stat().st_size // 1024
     w, h, fps = _VIDEO_SIZES.get(VIDEO_QUALITY, _VIDEO_SIZES["low"])
-    await message.reply_text(
+    await safe_reply(message, 
         f"الفيديو مفعّل\nالنوع: {kind}\nالجودة: {VIDEO_QUALITY} ({w}x{h})\nحجم المقطع: {size_kb} KB"
     )
 
@@ -2366,21 +2396,11 @@ async def start_next(chat_id: int) -> bool:
 
 
 async def ensure_call_permissions(message: Message) -> tuple[bool, str]:
-    """
-    Check only the permissions actually required for voice-chat playback.
-
-    The Bot API account does NOT need to be able to send messages for playback
-    to work. A failed bot message (ChatAdminRequired / Forbidden / etc.) must
-    never block PyTgCalls. The assistant account is the account that matters
-    for joining/streaming in the voice chat.
-    """
     if not ready_assistants():
         return False, "حساب المساعد غير متصل."
-
     a, reason = await pick_assistant(message.chat.id, message.chat.type)
     if a is None:
         return False, reason
-
     return True, ""
 
 
@@ -2471,7 +2491,7 @@ async def is_admin_for_command(message: Message) -> bool:
     # For channel posts there is no reliable actor identity. Authorization is
     # based on bot/assistant administrator status for the configured chat.
     if message.chat.type == ChatType.CHANNEL:
-        return await bot_is_admin(message.chat.id) and await any_assistant_admin(message.chat.id)
+        return await any_assistant_admin(message.chat.id)
     if not message.from_user:
         return False
     try:
@@ -3443,20 +3463,14 @@ async def main() -> None:
 
 
 if __name__ == "__main__":
-    # Keep the asyncio loop alive until PyTgCalls has fully cleaned up.
-    # Closing the loop here causes PyTgCalls' atexit callbacks to raise:
-    # "Event loop is closed" / "There is no current event loop".
     try:
         MAIN_LOOP.run_until_complete(main())
     except KeyboardInterrupt:
         pass
-    except SystemExit:
-        pass
     finally:
         try:
-            if not MAIN_LOOP.is_closed():
-                MAIN_LOOP.run_until_complete(asyncio.sleep(0))
+            MAIN_LOOP.run_until_complete(asyncio.sleep(0))
         except Exception:
             pass
-        # Do not explicitly close/set None: PyTgCalls performs final cleanup
-        # from an atexit callback and expects the event loop to still exist.
+        asyncio.set_event_loop(None)
+        MAIN_LOOP.close()
