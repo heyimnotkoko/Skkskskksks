@@ -1753,7 +1753,10 @@ _SYSTEM_FONTS = (
 )
 try:
     import arabic_reshaper as _ar
-    from bidi.algorithm import get_display as _bidi_display
+    try:  # python-bidi >= 0.5
+        from bidi import get_display as _bidi_display
+    except ImportError:  # older python-bidi
+        from bidi.algorithm import get_display as _bidi_display
 except Exception:  # noqa: BLE001
     _ar = None
     _bidi_display = None
