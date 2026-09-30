@@ -783,21 +783,19 @@ async def assistant_standing(a: Assistant, chat_id: int) -> str:
 
 
 async def usable_assistants(chat_id: int, candidates: list[Assistant], channel: bool) -> list[Assistant]:
-    """Admins first, then (groups only) plain members; both ordered by current load."""
+    """Admins first, then plain members; both ordered by current load."""
     if not candidates:
         return []
     standings = await asyncio.gather(*(assistant_standing(a, chat_id) for a in candidates))
     key = lambda x: (assistant_load(x), ASSISTANTS.index(x))  # noqa: E731
     admins = sorted((a for a, s in zip(candidates, standings) if s == "admin"), key=key)
-    if channel:
-        return admins
     members = sorted((a for a, s in zip(candidates, standings) if s == "member"), key=key)
     return admins + members
 
 
 async def pick_assistant(chat_id: int, chat_type: Any = None) -> tuple[Assistant | None, str]:
     """Choose the assistant that serves a chat: sticky while a call is active, otherwise
-    the least busy usable assistant (admin preferred, member accepted in groups)."""
+    the least busy usable assistant (admin preferred, plain member accepted)."""
     ready = ready_assistants()
     if not ready:
         return None, "حساب المساعد غير متصل."
@@ -810,8 +808,8 @@ async def pick_assistant(chat_id: int, chat_type: Any = None) -> tuple[Assistant
         return cur, ""
     channel = await is_channel_chat(chat_id, chat_type)
     usable = await usable_assistants(chat_id, ready, channel)
-    if not usable and not channel:
-        # Nobody is in the group yet: let the least busy assistant join by itself.
+    if not usable:
+        # Nobody is in the chat yet: let the least busy assistant join by itself.
         for a in sorted(ready, key=lambda x: (assistant_load(x), ASSISTANTS.index(x))):
             if await try_join(a, chat_id) and await assistant_standing(a, chat_id):
                 usable = [a]
@@ -819,7 +817,7 @@ async def pick_assistant(chat_id: int, chat_type: Any = None) -> tuple[Assistant
     if not usable:
         names = "، ".join(a.display() for a in ready[:3])
         if channel:
-            return None, f"في القنوات يجب أن يكون المساعد {names} مشرفًا (صلاحية إدارة البث المباشر)."
+            return None, f"تعذر دخول المساعد {names} إلى القناة تلقائيًا. أضفه إليها يدويًا ثم أعد المحاولة."
         return None, (
             f"تعذر دخول المساعد {names} إلى المجموعة تلقائيًا. أضفه يدويًا أو أعطِ البوت صلاحية "
             "دعوة المستخدمين، ثم أعد المحاولة."
@@ -2491,7 +2489,8 @@ async def is_admin_for_command(message: Message) -> bool:
     # For channel posts there is no reliable actor identity. Authorization is
     # based on bot/assistant administrator status for the configured chat.
     if message.chat.type == ChatType.CHANNEL:
-        return await any_assistant_admin(message.chat.id)
+        # Only admins can post in a channel, and the assistant needs no admin rights.
+        return bool(ready_assistants())
     if not message.from_user:
         return False
     try:
