@@ -530,6 +530,21 @@ def no_preview() -> dict[str, Any]:
     return {"disable_web_page_preview": True}
 
 
+WRITE_BLOCK_TTL = int(os.getenv("WRITE_BLOCK_TTL", "600"))
+WRITE_BLOCKED: dict[int, float] = {}
+
+def _write_blocked(chat_id: int) -> bool:
+    until = WRITE_BLOCKED.get(chat_id, 0.0)
+    if until and time.monotonic() < until:
+        return True
+    if until:
+        WRITE_BLOCKED.pop(chat_id, None)
+    return False
+
+def _mark_write_blocked(chat_id: int) -> None:
+    WRITE_BLOCKED[chat_id] = time.monotonic() + WRITE_BLOCK_TTL
+
+
 class MutedMessage:
     """Stand-in returned when the bot is not allowed to write in a chat.
     Every call is a harmless no-op, so the flow (and the music) carries on silently."""
@@ -566,10 +581,18 @@ async def report_cannot_send(chat_id: int, exc: Exception) -> None:
 
 
 async def safe_reply(message: Message, text: str, **kwargs: Any) -> Any:
+    chat_id = message.chat.id
+    if _write_blocked(chat_id):
+        return MutedMessage()
     try:
         return await message.reply_text(text, **kwargs)
     except RPCError as exc:
-        spawn(report_cannot_send(message.chat.id, exc))
+        _mark_write_blocked(chat_id)
+        spawn(report_cannot_send(chat_id, exc))
+        return MutedMessage()
+    except Exception as exc:
+        _mark_write_blocked(chat_id)
+        LOGGER.warning("Reply failed in chat %s: %s", chat_id, type(exc).__name__)
         return MutedMessage()
 
 
@@ -581,11 +604,15 @@ async def reply_temp(message: Message, text: str, delay: float | None = None, **
 
 
 async def send_temp(chat_id: int, text: str, delay: float = TEMP_MESSAGE_SECONDS) -> None:
+    if _write_blocked(chat_id):
+        return
     try:
         msg = await app.send_message(chat_id, text)
+        WRITE_BLOCKED.pop(chat_id, None)
         spawn(_delete_after(chat_id, msg.id, delay))
     except Exception as exc:  # noqa: BLE001
-        LOGGER.warning("Temp message failed: %s", type(exc).__name__)
+        _mark_write_blocked(chat_id)
+        LOGGER.warning("Temp message failed in chat %s: %s", chat_id, type(exc).__name__)
         if isinstance(exc, RPCError):
             spawn(report_cannot_send(chat_id, exc))
 
@@ -1607,19 +1634,24 @@ def now_playing_text(row: sqlite3.Row) -> str:
 async def update_now_playing(chat_id: int, row: sqlite3.Row) -> None:
     text = now_playing_text(row)
     old_id = NOW_PLAYING.get(chat_id)
+    if _write_blocked(chat_id):
+        return
     if old_id:
         try:
             await app.edit_message_text(chat_id, old_id, text, reply_markup=control_keyboard(chat_id))
             return
-        except RPCError:
+        except Exception:
             NOW_PLAYING.pop(chat_id, None)
     try:
         msg = await app.send_message(chat_id, text, reply_markup=control_keyboard(chat_id))
+        WRITE_BLOCKED.pop(chat_id, None)
         NOW_PLAYING[chat_id] = msg.id
         db_set_setting(f"np:{chat_id}", str(msg.id))
-    except RPCError as exc:
-        LOGGER.warning("Now playing message failed: %s", type(exc).__name__)
-        spawn(report_cannot_send(chat_id, exc))
+    except Exception as exc:
+        _mark_write_blocked(chat_id)
+        LOGGER.warning("Now playing message failed in chat %s: %s", chat_id, type(exc).__name__)
+        if isinstance(exc, RPCError):
+            spawn(report_cannot_send(chat_id, exc))
 
 
 async def clear_now_playing(chat_id: int) -> None:
@@ -2363,10 +2395,10 @@ async def start_next(chat_id: int) -> bool:
 
 
 async def ensure_call_permissions(message: Message) -> tuple[bool, str]:
+    # Bot API write permissions are deliberately NOT required for playback.
+    # The assistant account's ability to join/stream is what matters.
     if not ready_assistants():
         return False, "حساب المساعد غير متصل."
-    if not await bot_is_admin(message.chat.id):
-        return False, "يجب أن يكون البوت مشرفًا في هذه المحادثة."
     a, reason = await pick_assistant(message.chat.id, message.chat.type)
     if a is None:
         return False, reason
