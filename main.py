@@ -27,6 +27,10 @@ from pyrogram.errors import (
     PhoneNumberInvalid,
 )
 from pyrogram.types import InlineKeyboardButton, InlineKeyboardMarkup, Message, CallbackQuery
+try:  # newer Pyrogram forks deprecate disable_web_page_preview
+    from pyrogram.types import LinkPreviewOptions
+except ImportError:  # pragma: no cover
+    LinkPreviewOptions = None  # type: ignore[assignment]
 
 try:
     from pytgcalls import PyTgCalls, StreamType
@@ -508,7 +512,7 @@ def _is_private(message: Message) -> bool:
 
 
 def schedule_delete(msg: Message | None, delay: float) -> None:
-    if msg is None or getattr(msg, "chat", None) is None or _is_private(msg):
+    if msg is None or isinstance(msg, MutedMessage) or getattr(msg, "chat", None) is None or _is_private(msg):
         return
     spawn(_delete_after(msg.chat.id, msg.id, delay))
 
@@ -519,9 +523,59 @@ def delete_command(message: Message, delay: float = 1.0) -> None:
         schedule_delete(message, delay)
 
 
+def no_preview() -> dict[str, Any]:
+    """Keyword arguments that switch off link previews on any Pyrogram version."""
+    if LinkPreviewOptions is not None:
+        return {"link_preview_options": LinkPreviewOptions(is_disabled=True)}
+    return {"disable_web_page_preview": True}
+
+
+class MutedMessage:
+    """Stand-in returned when the bot is not allowed to write in a chat.
+    Every call is a harmless no-op, so the flow (and the music) carries on silently."""
+
+    id = 0
+    chat = None
+
+    async def edit_text(self, *args: Any, **kwargs: Any) -> "MutedMessage":
+        return self
+
+    edit = edit_caption = edit_reply_markup = edit_text
+
+    async def delete(self, *args: Any, **kwargs: Any) -> None:
+        return None
+
+    async def reply_text(self, *args: Any, **kwargs: Any) -> "MutedMessage":
+        return self
+
+
+async def report_cannot_send(chat_id: int, exc: Exception) -> None:
+    """The bot cannot post in this chat (e.g. a channel where it is admin without the
+    'Post messages' right). Tell the OWNER privately, once in a while - never the chat."""
+    LOGGER.warning("Cannot send to chat %s: %s", chat_id, type(exc).__name__)
+    title = await chat_title(chat_id)
+    await notify_owner(
+        f"cant_send:{chat_id}",
+        "🔇 تنبيه للمالك\n\n"
+        f"لا يستطيع البوت إرسال رسائل في: {title}\n({chat_id})\n"
+        f"السبب: {type(exc).__name__}\n\n"
+        "الحل: من إعدادات المشرفين في تلك المحادثة فعّل للبوت صلاحية إرسال الرسائل "
+        "(Post Messages). التشغيل الصوتي يستمر بصمت في هذه الأثناء.",
+        21600,
+    )
+
+
+async def safe_reply(message: Message, text: str, **kwargs: Any) -> Any:
+    try:
+        return await message.reply_text(text, **kwargs)
+    except RPCError as exc:
+        spawn(report_cannot_send(message.chat.id, exc))
+        return MutedMessage()
+
+
 async def reply_temp(message: Message, text: str, delay: float | None = None, **kwargs) -> Message:
     """Reply, then auto-delete the reply in groups/channels (private chats untouched)."""
-    msg = await message.reply_text(text, **kwargs)
+    msg = await safe_reply(message, text, **kwargs)
     schedule_delete(msg, delay if delay is not None else TEMP_MESSAGE_SECONDS)
     return msg
 
@@ -532,6 +586,8 @@ async def send_temp(chat_id: int, text: str, delay: float = TEMP_MESSAGE_SECONDS
         spawn(_delete_after(chat_id, msg.id, delay))
     except Exception as exc:  # noqa: BLE001
         LOGGER.warning("Temp message failed: %s", type(exc).__name__)
+        if isinstance(exc, RPCError):
+            spawn(report_cannot_send(chat_id, exc))
 
 
 def _is_already_joined(exc: Exception) -> bool:
@@ -741,7 +797,7 @@ async def notify_owner(key: str, text: str, cooldown: float | None = None) -> No
         return
     OWNER_ALERTS[key] = now
     try:
-        await app.send_message(OWNER_ID, text, parse_mode=ParseMode.DISABLED, disable_web_page_preview=True)
+        await app.send_message(OWNER_ID, text, parse_mode=ParseMode.DISABLED, **no_preview())
     except Exception as exc:  # noqa: BLE001 - owner never opened the bot / blocked it
         LOGGER.warning("Owner alert failed: %s", type(exc).__name__)
 
@@ -1489,6 +1545,7 @@ async def update_now_playing(chat_id: int, row: sqlite3.Row) -> None:
         db_set_setting(f"np:{chat_id}", str(msg.id))
     except RPCError as exc:
         LOGGER.warning("Now playing message failed: %s", type(exc).__name__)
+        spawn(report_cannot_send(chat_id, exc))
 
 
 async def clear_now_playing(chat_id: int) -> None:
@@ -1997,7 +2054,7 @@ async def start_handler(_, message: Message):
 @app.on_message(filters.command("ping"))
 async def ping_handler(_, message: Message):
     started = time.perf_counter()
-    msg = await message.reply_text("جارِ الفحص...")
+    msg = await safe_reply(message, "جارِ الفحص...")
     latency = (time.perf_counter() - started) * 1000
     await msg.edit_text(f"{BOT_NAME}\n\nزمن الاستجابة: `{latency:.0f} ms`\nمدة التشغيل: `{readable_time(int(time.time() - START_TIME))}`")
     schedule_delete(msg, 30)
@@ -2192,7 +2249,7 @@ async def search_handler(_, message: Message):
             duration = item.get("duration_string") or item.get("duration") or "غير معروف"
             url = item_url(item)
             lines.append(f"{i}. {title}\nالمدة: `{duration}`\nالرابط: {url}")
-        await status.edit_text(source_note + "\n\n".join(lines), disable_web_page_preview=True)
+        await status.edit_text(source_note + "\n\n".join(lines), **no_preview())
         schedule_delete(status, SEARCH_RESULT_SECONDS)
     except Exception as exc:
         await status.edit_text(f"فشل البحث.\n\n{await public_error(exc, 'search')}")
@@ -2308,7 +2365,7 @@ async def panel_show(query: CallbackQuery, text: str, rows: list[list[InlineKeyb
             text,
             reply_markup=InlineKeyboardMarkup(rows),
             parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            **no_preview(),
         )
     except RPCError as exc:
         if "MESSAGE_NOT_MODIFIED" not in str(exc).upper():
@@ -2878,7 +2935,7 @@ async def login_flow(_, message: Message):
                     return await message.reply_text("انتهت صلاحية الرمز. تم إرسال رمز جديد، أرسله الآن.")
                 except Exception as resend_exc:
                     LOGGER.warning("Code resend failed: %s", type(resend_exc).__name__)
-                    return await message.reply_text("انتهت صلاحية الرمز. أعد العملية من /المساعد.")
+                    return await message.reply_text("انتهت صلاحية الرمز. أعد العملية من /panel.")
             except PhoneCodeInvalid:
                 return await message.reply_text("رمز التحقق غير صحيح. أرسل الرمز الأخير الذي وصلك.")
             return await finish_login(message, state)
